@@ -10,7 +10,7 @@ export class MailServerUnavailableError extends Error {
   }
 }
 
-function isAuthFailure(err: unknown): boolean {
+export function isAuthFailure(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const e = err as {
     authenticationFailed?: boolean;
