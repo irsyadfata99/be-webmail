@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+model User {
+  id               String    @id @default(uuid())
+  email            String    @unique
+  displayName      String
+  signature        String?
+  role             Role      @default(USER)
+  isActive         Boolean   @default(true)
+  totpSecretEnc    String?
+  twoFactorEnabled Boolean   @default(false)
+  lastLoginAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  sessions  Session[]
+  auditLogs AuditLog[]
+
+  @@map("users")
+}
+
+model Session {
+  id                String    @id @default(uuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash         String    @unique
+  csrfTokenHash     String
+  credentialEnc     String
+  twoFactorVerified Boolean   @default(false)
+  ipAddress         String?
+  userAgent         String?
+  createdAt         DateTime  @default(now())
+  lastUsedAt        DateTime  @default(now())
+  expiresAt         DateTime
+  revokedAt         DateTime?
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model LoginAttempt {
+  id        String   @id @default(uuid())
+  email     String
+  ipAddress String
+  success   Boolean
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("login_attempts")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actorId     String?
+  actor       User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action      String
+  targetEmail String?
+  ipAddress   String?
+  userAgent   String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([targetEmail])
+  @@map("audit_logs")
+}
