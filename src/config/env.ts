@@ -30,6 +30,14 @@ const schema = z
     SMTP_PORT: port.default(465),
     SMTP_SECURE: z.stringbool().default(true),
 
+    MAIL_DOMAIN: z
+      .string()
+      .min(3)
+      .transform((v) => v.trim().toLowerCase().replace(/^@/, ""))
+      .pipe(
+        z.string().regex(/^[a-z0-9-]+(\.[a-z0-9-]+)+$/, "domain tidak valid"),
+      ),
+
     SESSION_SECRET: hex64,
     CREDENTIAL_ENCRYPTION_KEY: hex64,
     SESSION_TTL_HOURS: z.coerce.number().int().min(1).max(720).default(12),

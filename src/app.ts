@@ -7,12 +7,17 @@ import { env } from "./config/env.js";
 import { logger } from "./lib/logger.js";
 import { errorHandler, notFoundHandler } from "./middleware/error-handler.js";
 import { routes } from "./routes/index.js";
+import { originGuard } from "./middleware/csrf.js";
 
 export function createApp(): Express {
   const app = express();
 
   app.disable("x-powered-by");
 
+  app.use(express.json({ limit: "100kb" }));
+  app.use(originGuard);
+
+  app.use(routes);
   app.use(
     pinoHttp({
       logger,

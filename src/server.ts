@@ -2,6 +2,7 @@ import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { logger } from "./lib/logger.js";
 import { disconnectDatabase } from "./lib/prisma.js";
+import { startCleanupJob } from "./modules/auth/cleanup.js";
 
 const app = createApp();
 
@@ -9,12 +10,15 @@ const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT, env: env.NODE_ENV }, "server berjalan");
 });
 
+const cleanupTimer = startCleanupJob();
+
 let shuttingDown = false;
 
 function shutdown(signal: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, "menutup server");
+  clearInterval(cleanupTimer);
 
   const force = setTimeout(() => {
     logger.error("shutdown terlalu lama, keluar paksa");
