@@ -1,0 +1,24 @@
+services:
+  backend:
+    build:
+      context: .
+    image: mailweb-backend:1
+    container_name: mailweb-backend
+    restart: always
+    env_file:
+      - .env.production
+    ports:
+      - "10.10.10.2:3000:3000"
+    networks:
+      - mailweb-net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  mailweb-net:
+    external: true

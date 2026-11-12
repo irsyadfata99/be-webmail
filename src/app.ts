@@ -14,10 +14,10 @@ export function createApp(): Express {
 
   app.disable("x-powered-by");
 
-  app.use(express.json({ limit: "100kb" }));
-  app.use(originGuard);
+  if (env.TRUST_PROXY) {
+    app.set("trust proxy", env.TRUST_PROXY);
+  }
 
-  app.use(routes);
   app.use(
     pinoHttp({
       logger,
@@ -40,6 +40,7 @@ export function createApp(): Express {
     }),
   );
   app.use(express.json({ limit: "100kb" }));
+  app.use(originGuard);
 
   app.use(routes);
   app.use(notFoundHandler);

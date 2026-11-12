@@ -60,6 +60,18 @@ const schema = z
       .optional()
       .transform((v) => (v && v.trim().length > 0 ? v.trim() : undefined)),
 
+    // Jumlah reverse proxy tepercaya di depan backend (VPS = 1). 0 jika diakses langsung.
+    TRUST_PROXY: z
+      .string()
+      .optional()
+      .transform((v) => {
+        const list = (v ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        return list.length > 0 ? list : undefined;
+      }),
+
     MAX_ATTACHMENT_MB: z.coerce.number().int().min(1).max(100).default(10),
 
     ADMIN_EMAILS: z
