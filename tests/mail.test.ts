@@ -60,6 +60,23 @@ describe("mail (tanpa sesi)", () => {
     expect(res.status).toBe(401);
   });
 
+  it("simpan draf tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app)
+      .post("/api/mail/drafts")
+      .send({ subject: "x" });
+    expect(res.status).toBe(401);
+  });
+
+  it("membuka draf tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app).get("/api/mail/drafts/1");
+    expect(res.status).toBe(401);
+  });
+
+  it("menghapus draf tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app).delete("/api/mail/drafts/1");
+    expect(res.status).toBe(401);
+  });
+
   it("membuka satu pesan tanpa sesi mengembalikan 401", async () => {
     const res = await request(app).get("/api/mail/messages/1");
     expect(res.status).toBe(401);

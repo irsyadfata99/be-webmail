@@ -15,6 +15,7 @@ import {
   allRecipients,
   buildMailOptions,
 } from "./mail.compose.js";
+import { deleteDraftQuietly, loadDraftAttachments } from "./mail.draft.js";
 import { smtpError } from "./mail.errors.js";
 import type { SendBody } from "./mail.schema.js";
 import {
@@ -197,6 +198,20 @@ export async function sendMessage(
       }),
     );
   }
+  if (input.draft && input.draft.keepAttachments.length > 0) {
+    const kept = await loadDraftAttachments(
+      auth,
+      input.draft.uid,
+      input.draft.keepAttachments,
+    );
+    kept.forEach((a, i) =>
+      forwarded.push({
+        filename: safeFilename(a.filename, `lampiran-draf-${i + 1}`),
+        contentType: a.contentType,
+        content: a.content,
+      }),
+    );
+  }
   const attachments = [...uploaded, ...forwarded];
   const totalProblem = checkTotalBytes(
     attachments.reduce((sum, f) => sum + f.content.length, 0),
@@ -262,6 +277,7 @@ export async function sendMessage(
 
   const sentCopy = await saveToSent(auth, raw);
   if (input.original) await markOriginal(auth, input.original);
+  if (input.draft) await deleteDraftQuietly(auth, input.draft.uid);
 
   await finalizeSendSlot(slotId, AUDIT_MAIL_SENT, {
     recipients: allRecipients(input).length,

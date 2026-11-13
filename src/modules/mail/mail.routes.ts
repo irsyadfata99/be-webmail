@@ -14,6 +14,7 @@ import {
   attachmentParams,
   attachmentQuery,
   composeDraftQuery,
+  draftBody,
   getMessageQuery,
   listMessagesQuery,
   messageParams,
@@ -26,6 +27,7 @@ import {
   isInlineImageType,
   safeFilename,
 } from "./mail.attachment.js";
+import { deleteSavedDraft, getSavedDraft, saveDraft } from "./mail.draft.js";
 import { type OutgoingFile, sendMessage } from "./mail.send.js";
 import {
   getAttachment,
@@ -38,6 +40,23 @@ import {
 const mailLimiter = rateLimit({
   windowMs: 60_000,
   limit: 120,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  skip: () => env.NODE_ENV === "test",
+  handler: (_req, _res, next) =>
+    next(
+      new AppError(
+        429,
+        "TOO_MANY_REQUESTS",
+        "Terlalu banyak permintaan. Coba lagi sebentar lagi.",
+      ),
+    ),
+});
+
+// Autosave draf dibatasi sendiri agar tidak menghabiskan batas umum di atas.
+const draftLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 60,
   standardHeaders: "draft-8",
   legacyHeaders: false,
   skip: () => env.NODE_ENV === "test",
@@ -177,18 +196,43 @@ function sendPayload(req: Request): unknown {
   }
 }
 
-// Kirim pesan baru: JSON biasa, atau multipart (kolom `payload` JSON + berkas `attachments`).
-// Pengirim selalu akun sesi; dibatasi jumlah penerima, lampiran, dan per jam.
-mailRouter.post("/send", parseUpload, async (req, res) => {
-  const body = sendBody.parse(sendPayload(req));
-  const files: OutgoingFile[] = (
-    (req.files as Express.Multer.File[] | undefined) ?? []
-  ).map((f) => ({
+function uploadedFiles(req: Request): OutgoingFile[] {
+  return ((req.files as Express.Multer.File[] | undefined) ?? []).map((f) => ({
     filename: fixFilenameEncoding(f.originalname),
     contentType: f.mimetype,
     content: f.buffer,
   }));
+}
+
+// Kirim pesan baru: JSON biasa, atau multipart (kolom `payload` JSON + berkas `attachments`).
+// Pengirim selalu akun sesi; dibatasi jumlah penerima, lampiran, dan per jam.
+mailRouter.post("/send", parseUpload, async (req, res) => {
+  const body = sendBody.parse(sendPayload(req));
+  const files = uploadedFiles(req);
   const result = await sendMessage(req, authOf(req), body, files);
   res.set("Cache-Control", "no-store");
   res.status(201).json(result);
+});
+
+// Draf tersimpan (folder Drafts). Simpan dan perbarui memakai satu endpoint:
+// kirim replaceUid dari hasil simpan sebelumnya, dan pakai UID baru dari hasilnya.
+// Bentuk request sama dengan /send: JSON biasa, atau multipart (payload + attachments).
+mailRouter.post("/drafts", draftLimiter, parseUpload, async (req, res) => {
+  const body = draftBody.parse(sendPayload(req));
+  const result = await saveDraft(authOf(req), body, uploadedFiles(req));
+  res.set("Cache-Control", "no-store");
+  res.json(result);
+});
+
+mailRouter.get("/drafts/:uid", draftLimiter, async (req, res) => {
+  const { uid } = messageParams.parse(req.params);
+  const draft = await getSavedDraft(authOf(req), uid);
+  res.set("Cache-Control", "no-store");
+  res.json(draft);
+});
+
+mailRouter.delete("/drafts/:uid", draftLimiter, async (req, res) => {
+  const { uid } = messageParams.parse(req.params);
+  await deleteSavedDraft(authOf(req), uid);
+  res.status(204).end();
 });
