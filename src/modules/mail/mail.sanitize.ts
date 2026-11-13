@@ -23,7 +23,8 @@ const COLOR = [
   /^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(,\s*[\d.]+\s*)?\)$/i,
   /^[a-z]{3,30}$/i,
 ];
-const LENGTH = [/^-?\d{1,4}(\.\d{1,2})?(px|em|rem|%|pt)?$/i];
+// Tanpa nilai negatif: margin negatif bisa menggeser isi email menimpa tampilan aplikasi.
+const LENGTH = [/^\d{1,4}(\.\d{1,2})?(px|em|rem|%|pt)?$/i];
 
 /**
  * Gaya inline: hanya properti kosmetik dengan nilai sederhana. Karena nilai

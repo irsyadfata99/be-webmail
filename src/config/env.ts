@@ -72,7 +72,16 @@ const schema = z
         return list.length > 0 ? list : undefined;
       }),
 
+    // Batas per berkas dan total lampiran per pesan (ukuran mentah). Setelah base64
+    // ukuran pesan sekitar 1,37x lipat, jadi total dijaga jauh di bawah batas server
+    // dan penerima (Gmail 25 MB). Samakan dengan POSTFIX_MESSAGE_SIZE_LIMIT, relay VPS, dan Nginx.
     MAX_ATTACHMENT_MB: z.coerce.number().int().min(1).max(100).default(10),
+    MAX_TOTAL_ATTACHMENT_MB: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .default(15),
 
     ADMIN_EMAILS: z
       .string()
@@ -87,6 +96,10 @@ const schema = z
   .refine((e) => e.SESSION_SECRET !== e.CREDENTIAL_ENCRYPTION_KEY, {
     message: "SESSION_SECRET dan CREDENTIAL_ENCRYPTION_KEY tidak boleh sama",
     path: ["CREDENTIAL_ENCRYPTION_KEY"],
+  })
+  .refine((e) => e.MAX_ATTACHMENT_MB <= e.MAX_TOTAL_ATTACHMENT_MB, {
+    message: "tidak boleh lebih besar dari MAX_TOTAL_ATTACHMENT_MB",
+    path: ["MAX_ATTACHMENT_MB"],
   })
   .refine((e) => e.NODE_ENV !== "production" || e.COOKIE_SECURE, {
     message: "wajib true di production",

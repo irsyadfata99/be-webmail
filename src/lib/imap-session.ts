@@ -5,6 +5,7 @@ import { CREDENTIAL_CONTEXT } from "../modules/auth/auth.service.js";
 import { decrypt } from "./crypto.js";
 import { isAuthFailure } from "./imap.js";
 import { logger } from "./logger.js";
+import { prisma } from "./prisma.js";
 
 /**
  * Membuka satu koneksi IMAP atas nama user yang sedang login, menjalankan `fn`,
@@ -19,6 +20,23 @@ export function decryptCredential(auth: Express.AuthContext): string {
       "UNAUTHORIZED",
       "Sesi tidak valid atau sudah berakhir",
     );
+  }
+}
+
+/**
+ * Mencabut sesi saat server mail menolak password tersimpan (biasanya password
+ * diganti di tempat lain). Tanpa ini, tiap permintaan mengulang login yang gagal.
+ */
+export async function revokeSessionForBadCredential(
+  auth: Express.AuthContext,
+): Promise<void> {
+  try {
+    await prisma.session.updateMany({
+      where: { id: auth.sessionId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  } catch (err) {
+    logger.warn({ err }, "gagal mencabut sesi dengan kredensial tidak valid");
   }
 }
 
@@ -47,6 +65,7 @@ export async function withMailbox<T>(
       await client.connect();
     } catch (err) {
       if (isAuthFailure(err)) {
+        await revokeSessionForBadCredential(auth);
         throw new AppError(
           401,
           "MAIL_CREDENTIAL_INVALID",

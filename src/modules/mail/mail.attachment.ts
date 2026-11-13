@@ -56,7 +56,8 @@ export function normalizeCid(cid: string | undefined | null): string {
 
 /** Batas lampiran keluar. Ukuran per berkas mengikuti MAX_ATTACHMENT_MB di env. */
 export const MAX_OUTGOING_FILES = 10;
-export const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+/** Bawaan total lampiran per pesan; nilai sebenarnya dari MAX_TOTAL_ATTACHMENT_MB di env. */
+export const MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 
 /** Ekstensi yang ditolak untuk lampiran keluar, seperti kebanyakan penyedia email. */
 const BLOCKED_EXTENSIONS = new Set([
@@ -140,8 +141,11 @@ export function checkOutgoingAttachments(
   return null;
 }
 
-export function checkTotalBytes(totalBytes: number): OutgoingProblem | null {
-  return totalBytes > MAX_TOTAL_ATTACHMENT_BYTES
+export function checkTotalBytes(
+  totalBytes: number,
+  maxBytes: number = MAX_TOTAL_ATTACHMENT_BYTES,
+): OutgoingProblem | null {
+  return totalBytes > maxBytes
     ? {
         status: 413,
         code: "ATTACHMENTS_TOO_LARGE",

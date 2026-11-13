@@ -39,6 +39,15 @@ describe("sanitizeEmailHtml", () => {
     expect(html).not.toMatch(/url\(|background-image|position/i);
   });
 
+  it("membuang nilai negatif di style agar isi email tidak menimpa tampilan aplikasi", () => {
+    const { html } = sanitizeEmailHtml(
+      `<p style="margin:-9999px;width:-50px;padding:8px">a</p>`,
+      false,
+    );
+    expect(html).toContain("padding:8px");
+    expect(html).not.toMatch(/margin|width|-9999|-50/i);
+  });
+
   it("memblokir gambar eksternal secara bawaan dan menghitungnya", () => {
     const input = `<img src="https://pelacak.example/p.gif" alt="a"><img src="//pelacak.example/q.gif"><img src="cid:logo@x">`;
     const blocked = sanitizeEmailHtml(input, false);

@@ -2,8 +2,11 @@ import type { Request } from "express";
 import nodemailer from "nodemailer";
 import type { SendMailOptions } from "nodemailer";
 import { env } from "../../config/env.js";
-import { writeAudit } from "../../lib/audit.js";
-import { decryptCredential, withMailbox } from "../../lib/imap-session.js";
+import {
+  decryptCredential,
+  revokeSessionForBadCredential,
+  withMailbox,
+} from "../../lib/imap-session.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { AppError } from "../../middleware/error-handler.js";
@@ -12,6 +15,7 @@ import {
   allRecipients,
   buildMailOptions,
 } from "./mail.compose.js";
+import { smtpError } from "./mail.errors.js";
 import type { SendBody } from "./mail.schema.js";
 import {
   checkOutgoingAttachments,
@@ -42,47 +46,77 @@ function problemToError(p: OutgoingProblem): AppError {
 }
 
 export const AUDIT_MAIL_SENT = "MAIL_SENT";
+export const AUDIT_MAIL_SEND_FAILED = "MAIL_SEND_FAILED";
 
+type AuditMeta = Record<string, string | number | boolean | null>;
+
+const SEND_WINDOW_MS = 60 * 60 * 1000;
+
+function tooManySends(): AppError {
+  return new AppError(
+    429,
+    "SEND_LIMIT_REACHED",
+    "Batas pengiriman per jam tercapai. Coba lagi nanti.",
+  );
+}
+
+/** Pemeriksaan cepat sebelum pekerjaan berat. Tidak atomik; yang mengikat adalah reserveSendSlot. */
 async function assertWithinSendLimit(userId: string): Promise<void> {
-  const since = new Date(Date.now() - 60 * 60 * 1000);
   const count = await prisma.auditLog.count({
     where: {
       actorId: userId,
       action: AUDIT_MAIL_SENT,
-      createdAt: { gte: since },
+      createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) },
     },
   });
-  if (count >= SENDS_PER_HOUR) {
-    throw new AppError(
-      429,
-      "SEND_LIMIT_REACHED",
-      "Batas pengiriman per jam tercapai. Coba lagi nanti.",
-    );
-  }
+  if (count >= SENDS_PER_HOUR) throw tooManySends();
 }
 
-function smtpError(err: unknown): AppError {
-  const e = err as { code?: string; responseCode?: number };
-  if (e.code === "EAUTH") {
-    return new AppError(
-      401,
-      "MAIL_CREDENTIAL_INVALID",
-      "Password email sudah berubah. Silakan login ulang.",
-    );
+/**
+ * Memesan satu jatah kirim secara atomik: hitung dan catat dalam satu transaksi
+ * dengan kunci per pengguna, sehingga permintaan paralel tidak bisa melewati batas.
+ * Catatan ini diperbarui setelah kirim (berhasil atau gagal).
+ */
+export async function reserveSendSlot(
+  req: Request,
+  userId: string,
+): Promise<string> {
+  const since = new Date(Date.now() - SEND_WINDOW_MS);
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${userId}))`;
+    const count = await tx.auditLog.count({
+      where: {
+        actorId: userId,
+        action: AUDIT_MAIL_SENT,
+        createdAt: { gte: since },
+      },
+    });
+    if (count >= SENDS_PER_HOUR) throw tooManySends();
+    const row = await tx.auditLog.create({
+      data: {
+        actorId: userId,
+        action: AUDIT_MAIL_SENT,
+        ipAddress: req.ip ?? null,
+        userAgent: req.get("user-agent")?.slice(0, 300) ?? null,
+        metadata: { pending: true },
+      },
+      select: { id: true },
+    });
+    return row.id;
+  });
+}
+
+/** Menutup catatan jatah kirim. Kegagalan di sini hanya dicatat di log. */
+async function finalizeSendSlot(
+  id: string,
+  action: string,
+  metadata: AuditMeta,
+): Promise<void> {
+  try {
+    await prisma.auditLog.update({ where: { id }, data: { action, metadata } });
+  } catch (err) {
+    logger.error({ err, id }, "gagal memperbarui catatan pengiriman");
   }
-  if (e.code === "EENVELOPE" || (e.responseCode && e.responseCode >= 500)) {
-    return new AppError(
-      422,
-      "RECIPIENT_REJECTED",
-      "Pesan ditolak oleh mail server. Periksa alamat penerima.",
-    );
-  }
-  logger.error({ err }, "gagal mengirim lewat SMTP");
-  return new AppError(
-    503,
-    "MAIL_SERVER_UNAVAILABLE",
-    "Mail server sedang tidak dapat dihubungi. Coba lagi nanti.",
-  );
 }
 
 /** Menyimpan salinan ke folder Sent. Kegagalan di sini tidak membatalkan pengiriman. */
@@ -166,6 +200,7 @@ export async function sendMessage(
   const attachments = [...uploaded, ...forwarded];
   const totalProblem = checkTotalBytes(
     attachments.reduce((sum, f) => sum + f.content.length, 0),
+    env.MAX_TOTAL_ATTACHMENT_MB * 1024 * 1024,
   );
   if (totalProblem) throw problemToError(totalProblem);
 
@@ -195,11 +230,15 @@ export async function sendMessage(
   };
   const raw = built.message;
 
+  // Dekripsi dulu, sebelum jatah kirim dipesan, agar sesi rusak tidak memakai jatah.
+  const password = decryptCredential(auth);
+  const slotId = await reserveSendSlot(req, auth.user.id);
+
   const transport = nodemailer.createTransport({
     host: env.SMTP_HOST,
     port: env.SMTP_PORT,
     secure: env.SMTP_SECURE,
-    auth: { user: auth.user.email, pass: decryptCredential(auth) },
+    auth: { user: auth.user.email, pass: password },
     connectionTimeout: 10_000,
     greetingTimeout: 10_000,
     socketTimeout: 30_000,
@@ -209,7 +248,14 @@ export async function sendMessage(
   try {
     info = (await transport.sendMail(options)) as unknown as typeof info;
   } catch (err) {
-    throw smtpError(err);
+    const mapped = smtpError(err);
+    await finalizeSendSlot(slotId, AUDIT_MAIL_SEND_FAILED, {
+      reason: mapped.code,
+    });
+    if (mapped.code === "MAIL_CREDENTIAL_INVALID") {
+      await revokeSessionForBadCredential(auth);
+    }
+    throw mapped;
   } finally {
     transport.close();
   }
@@ -217,15 +263,11 @@ export async function sendMessage(
   const sentCopy = await saveToSent(auth, raw);
   if (input.original) await markOriginal(auth, input.original);
 
-  await writeAudit(req, {
-    actorId: auth.user.id,
-    action: AUDIT_MAIL_SENT,
-    metadata: {
-      recipients: allRecipients(input).length,
-      hasHtml: Boolean(input.html),
-      attachments: attachments.length,
-      sentCopy,
-    },
+  await finalizeSendSlot(slotId, AUDIT_MAIL_SENT, {
+    recipients: allRecipients(input).length,
+    hasHtml: Boolean(input.html),
+    attachments: attachments.length,
+    sentCopy,
   });
 
   return {

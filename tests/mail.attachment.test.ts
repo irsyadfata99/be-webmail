@@ -121,10 +121,17 @@ describe("checkOutgoingAttachments dan checkTotalBytes", () => {
     );
   });
 
-  it("total ukuran dibatasi 25 MB", () => {
+  it("total ukuran dibatasi (bawaan 15 MB)", () => {
+    expect(MAX_TOTAL_ATTACHMENT_BYTES).toBe(15 * 1024 * 1024);
     expect(checkTotalBytes(MAX_TOTAL_ATTACHMENT_BYTES)).toBeNull();
     expect(checkTotalBytes(MAX_TOTAL_ATTACHMENT_BYTES + 1)?.code).toBe(
       "ATTACHMENTS_TOO_LARGE",
     );
+  });
+
+  it("total ukuran mengikuti batas yang diberikan", () => {
+    const max = 5 * 1024 * 1024;
+    expect(checkTotalBytes(max, max)).toBeNull();
+    expect(checkTotalBytes(max + 1, max)?.code).toBe("ATTACHMENTS_TOO_LARGE");
   });
 });
