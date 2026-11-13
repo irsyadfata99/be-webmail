@@ -128,3 +128,18 @@ export async function extractAttachment(
     content: a.content,
   };
 }
+
+/** Semua lampiran biasa (bukan gambar tertanam di badan pesan); dipakai saat meneruskan. */
+export async function extractAllAttachments(
+  source: Buffer,
+): Promise<AttachmentContent[]> {
+  const mail = await simpleParser(source, { skipImageLinks: true });
+  return mail.attachments
+    .filter((a) => a.related !== true)
+    .map((a) => ({
+      filename: a.filename ?? "",
+      contentType: a.contentType,
+      size: a.size,
+      content: a.content,
+    }));
+}

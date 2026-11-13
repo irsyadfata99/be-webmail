@@ -10,13 +10,9 @@ import { logger } from "./logger.js";
  * Membuka satu koneksi IMAP atas nama user yang sedang login, menjalankan `fn`,
  * lalu menutup koneksi. Password IMAP didekripsi dari sesi hanya selama pemanggilan ini.
  */
-export async function withMailbox<T>(
-  auth: Express.AuthContext,
-  fn: (client: ImapFlow) => Promise<T>,
-): Promise<T> {
-  let password: string;
+export function decryptCredential(auth: Express.AuthContext): string {
   try {
-    password = decrypt(auth.credentialEnc, CREDENTIAL_CONTEXT);
+    return decrypt(auth.credentialEnc, CREDENTIAL_CONTEXT);
   } catch {
     throw new AppError(
       401,
@@ -24,6 +20,13 @@ export async function withMailbox<T>(
       "Sesi tidak valid atau sudah berakhir",
     );
   }
+}
+
+export async function withMailbox<T>(
+  auth: Express.AuthContext,
+  fn: (client: ImapFlow) => Promise<T>,
+): Promise<T> {
+  const password = decryptCredential(auth);
 
   const client = new ImapFlow({
     host: env.IMAP_HOST,

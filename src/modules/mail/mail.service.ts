@@ -4,9 +4,15 @@ import { AppError } from "../../middleware/error-handler.js";
 import {
   type AttachmentContent,
   type ParsedMessage,
+  extractAllAttachments,
   extractAttachment,
   parseRawMessage,
 } from "./mail.parse.js";
+import {
+  type ComposeDraft,
+  type ComposeMode,
+  buildComposeDraft,
+} from "./mail.reply.js";
 import {
   type FolderInfo,
   type MailAddress,
@@ -148,6 +154,54 @@ export async function getMessage(
         answered: flags.has("\\Answered"),
         draft: flags.has("\\Draft"),
       };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+export async function getComposeDraft(
+  auth: Express.AuthContext,
+  folder: string,
+  uid: number,
+  mode: ComposeMode,
+): Promise<
+  ComposeDraft & {
+    original: { folder: string; uid: number; kind: "reply" | "forward" };
+  }
+> {
+  return withMailbox(auth, async (client) => {
+    const lock = await lockFolder(client, folder);
+    try {
+      const { source } = await loadSource(client, uid);
+      // Gambar eksternal tetap diblokir pada kutipan.
+      const parsed = await parseRawMessage(source, false);
+      const draft = buildComposeDraft(parsed, mode, auth.user.email);
+      return {
+        ...draft,
+        original: {
+          folder,
+          uid,
+          kind: mode === "forward" ? "forward" : "reply",
+        },
+      };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/** Lampiran pesan asli untuk diteruskan, diambil langsung dari server mail. */
+export async function loadForwardAttachments(
+  auth: Express.AuthContext,
+  folder: string,
+  uid: number,
+): Promise<AttachmentContent[]> {
+  return withMailbox(auth, async (client) => {
+    const lock = await lockFolder(client, folder);
+    try {
+      const { source } = await loadSource(client, uid);
+      return await extractAllAttachments(source);
     } finally {
       lock.release();
     }

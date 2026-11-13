@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  extractAllAttachments,
   extractAttachment,
   parseRawMessage,
 } from "../src/modules/mail/mail.parse.js";
@@ -182,5 +183,13 @@ describe("extractAttachment", () => {
     expect(a?.contentType).toBe("application/pdf");
     expect(a?.content.subarray(0, 4).toString()).toBe("%PDF");
     expect(await extractAttachment(Buffer.from(raw), 5)).toBeNull();
+  });
+});
+
+describe("extractAllAttachments", () => {
+  it("mengambil lampiran biasa dan melewati gambar tertanam", async () => {
+    const all = await extractAllAttachments(Buffer.from(raw));
+    expect(all.map((a) => a.filename)).toEqual(["laporan.pdf"]);
+    expect(await extractAllAttachments(Buffer.from(rawInline))).toEqual([]);
   });
 });

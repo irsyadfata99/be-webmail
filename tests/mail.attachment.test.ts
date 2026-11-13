@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_TOTAL_ATTACHMENT_BYTES,
+  checkOutgoingAttachments,
+  checkTotalBytes,
+  fixFilenameEncoding,
+  isBlockedExtension,
   downloadContentType,
   isInlineImageType,
   normalizeCid,
@@ -61,5 +66,65 @@ describe("normalizeCid", () => {
   it("membuang kurung sudut dan menyamakan huruf", () => {
     expect(normalizeCid("<Logo@X>")).toBe("logo@x");
     expect(normalizeCid(undefined)).toBe("");
+  });
+});
+
+describe("isBlockedExtension", () => {
+  it("menolak ekstensi berbahaya, tanpa peduli huruf besar-kecil", () => {
+    expect(isBlockedExtension("virus.exe")).toBe(true);
+    expect(isBlockedExtension("Skrip.PS1")).toBe(true);
+    expect(isBlockedExtension("laporan.pdf.scr")).toBe(true);
+  });
+
+  it("mengizinkan berkas biasa", () => {
+    expect(isBlockedExtension("laporan.pdf")).toBe(false);
+    expect(isBlockedExtension("catatan")).toBe(false);
+    expect(isBlockedExtension("a.exe.txt")).toBe(false);
+  });
+});
+
+describe("fixFilenameEncoding", () => {
+  it("memulihkan nama UTF-8 yang terbaca sebagai latin1", () => {
+    const garbled = Buffer.from("Laporan é.pdf", "utf8").toString("latin1");
+    expect(fixFilenameEncoding(garbled)).toBe("Laporan é.pdf");
+  });
+
+  it("tidak mengubah nama ASCII atau yang sudah UTF-8", () => {
+    expect(fixFilenameEncoding("laporan.pdf")).toBe("laporan.pdf");
+    expect(fixFilenameEncoding("日本語.pdf")).toBe("日本語.pdf");
+  });
+});
+
+describe("checkOutgoingAttachments dan checkTotalBytes", () => {
+  const max = 10 * 1024 * 1024;
+
+  it("lolos untuk berkas wajar", () => {
+    expect(
+      checkOutgoingAttachments([{ filename: "a.pdf", size: 1000 }], max),
+    ).toBeNull();
+  });
+
+  it("menolak ekstensi terlarang, berkas terlalu besar, dan terlalu banyak berkas", () => {
+    expect(
+      checkOutgoingAttachments([{ filename: "a.exe", size: 1 }], max)?.code,
+    ).toBe("ATTACHMENT_TYPE_BLOCKED");
+    expect(
+      checkOutgoingAttachments([{ filename: "a.pdf", size: max + 1 }], max)
+        ?.status,
+    ).toBe(413);
+    const many = Array.from({ length: 11 }, (_, i) => ({
+      filename: `f${i}.txt`,
+      size: 1,
+    }));
+    expect(checkOutgoingAttachments(many, max)?.code).toBe(
+      "TOO_MANY_ATTACHMENTS",
+    );
+  });
+
+  it("total ukuran dibatasi 25 MB", () => {
+    expect(checkTotalBytes(MAX_TOTAL_ATTACHMENT_BYTES)).toBeNull();
+    expect(checkTotalBytes(MAX_TOTAL_ATTACHMENT_BYTES + 1)?.code).toBe(
+      "ATTACHMENTS_TOO_LARGE",
+    );
   });
 });

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_RECIPIENTS } from "./mail.compose.js";
 
 const noControlChars = (value: string) =>
   ![...value].some((ch) => {
@@ -45,4 +46,59 @@ export const attachmentParams = z.object({
 export const attachmentQuery = z.object({
   folder: listMessagesQuery.shape.folder,
   inline: flag,
+});
+
+const noLineBreaks = (value: string) => !/[\r\n]/.test(value);
+
+const recipient = z.string().trim().toLowerCase().max(254).pipe(z.email());
+
+const messageIdRef = z
+  .string()
+  .trim()
+  .max(998)
+  .regex(/^<[^\s<>]+>$/, "format Message-ID tidak valid");
+
+export const sendBody = z
+  .object({
+    to: z.array(recipient).min(1).max(50),
+    cc: z.array(recipient).max(50).default([]),
+    bcc: z.array(recipient).max(50).default([]),
+    subject: z
+      .string()
+      .trim()
+      .max(255)
+      .refine(noLineBreaks, "subjek tidak boleh berisi baris baru")
+      .default(""),
+    text: z.string().max(500_000).optional(),
+    html: z.string().max(1_000_000).optional(),
+    inReplyTo: messageIdRef.optional(),
+    references: z.array(messageIdRef).max(50).default([]),
+    // Pesan asal balasan/terusan; dipakai menandai \\Answered atau $Forwarded setelah terkirim.
+    original: z
+      .object({
+        folder: listMessagesQuery.shape.folder,
+        uid: messageParams.shape.uid,
+        kind: z.enum(["reply", "forward"]),
+      })
+      .optional(),
+    forwardAttachments: z.boolean().default(false),
+  })
+  .refine((b) => !b.forwardAttachments || b.original?.kind === "forward", {
+    message: "forwardAttachments hanya untuk pesan terusan",
+    path: ["forwardAttachments"],
+  })
+  .refine((b) => Boolean(b.text?.trim() || b.html?.trim()), {
+    message: "isi pesan (text atau html) wajib diisi",
+    path: ["text"],
+  })
+  .refine((b) => new Set([...b.to, ...b.cc, ...b.bcc]).size <= MAX_RECIPIENTS, {
+    message: `maksimal ${MAX_RECIPIENTS} penerima`,
+    path: ["to"],
+  });
+
+export type SendBody = z.infer<typeof sendBody>;
+
+export const composeDraftQuery = z.object({
+  folder: listMessagesQuery.shape.folder,
+  mode: z.enum(["reply", "replyAll", "forward"]),
 });

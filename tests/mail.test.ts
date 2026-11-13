@@ -35,6 +35,31 @@ describe("mail (tanpa sesi)", () => {
     expect(res.status).toBe(401);
   });
 
+  it("kirim tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app)
+      .post("/api/mail/send")
+      .send({ to: ["a@motioneggstudios.com"], text: "x" });
+    expect(res.status).toBe(401);
+  });
+
+  it("draf balasan tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app)
+      .get("/api/mail/messages/1/draft")
+      .query({ mode: "reply" });
+    expect(res.status).toBe(401);
+  });
+
+  it("kirim multipart tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app)
+      .post("/api/mail/send")
+      .field(
+        "payload",
+        JSON.stringify({ to: ["a@motioneggstudios.com"], text: "x" }),
+      )
+      .attach("attachments", Buffer.from("isi"), "catatan.txt");
+    expect(res.status).toBe(401);
+  });
+
   it("membuka satu pesan tanpa sesi mengembalikan 401", async () => {
     const res = await request(app).get("/api/mail/messages/1");
     expect(res.status).toBe(401);
@@ -131,6 +156,30 @@ describe("mail (dengan sesi)", () => {
         expect(typeof one.body.blockedImages).toBe("number");
         expect(one.body.html ?? "").not.toMatch(/<script/i);
 
+        const reply = await agent
+          .get(`/api/mail/messages/${first.uid}/draft`)
+          .query({ folder: "INBOX", mode: "reply" });
+        expect(reply.status).toBe(200);
+        expect(reply.body.subject).toMatch(/^Re:/);
+        expect(reply.body.original).toEqual({
+          folder: "INBOX",
+          uid: first.uid,
+          kind: "reply",
+        });
+        expect(Array.isArray(reply.body.to)).toBe(true);
+
+        const fwd = await agent
+          .get(`/api/mail/messages/${first.uid}/draft`)
+          .query({ folder: "INBOX", mode: "forward" });
+        expect(fwd.status).toBe(200);
+        expect(fwd.body.to).toEqual([]);
+        expect(fwd.body.subject).toMatch(/^Fwd:/);
+
+        const badMode = await agent
+          .get(`/api/mail/messages/${first.uid}/draft`)
+          .query({ mode: "bukan-mode" });
+        expect(badMode.status).toBe(400);
+
         const noAtt = await agent
           .get(`/api/mail/messages/${first.uid}/attachments/999`)
           .query({ folder: "INBOX" });
@@ -148,6 +197,72 @@ describe("mail (dengan sesi)", () => {
           expect(dl.headers["content-disposition"]).toContain("attachment");
           expect(dl.headers["x-content-type-options"]).toBe("nosniff");
         }
+      }
+
+      const cookies = (login.headers["set-cookie"] ??
+        []) as unknown as string[];
+      const csrf = cookies
+        .find((c) => c.startsWith("csrf_token="))
+        ?.split(";")[0]
+        ?.split("=")[1];
+      expect(csrf).toBeDefined();
+
+      const noCsrf = await agent
+        .post("/api/mail/send")
+        .send({ to: [TEST_EMAIL], text: "x" });
+      expect(noCsrf.status).toBe(403);
+      expect(noCsrf.body.error.code).toBe("CSRF_INVALID");
+
+      const badBody = await agent
+        .post("/api/mail/send")
+        .set("X-CSRF-Token", csrf ?? "")
+        .send({ to: [], text: "x" });
+      expect(badBody.status).toBe(400);
+      expect(badBody.body.error.code).toBe("VALIDATION_ERROR");
+
+      const blocked = await agent
+        .post("/api/mail/send")
+        .set("X-CSRF-Token", csrf ?? "")
+        .field("payload", JSON.stringify({ to: [TEST_EMAIL], text: "x" }))
+        .attach("attachments", Buffer.from("MZ"), "virus.exe");
+      expect(blocked.status).toBe(400);
+      expect(blocked.body.error.code).toBe("ATTACHMENT_TYPE_BLOCKED");
+
+      const noPayload = await agent
+        .post("/api/mail/send")
+        .set("X-CSRF-Token", csrf ?? "")
+        .attach("attachments", Buffer.from("isi"), "catatan.txt");
+      expect(noPayload.status).toBe(400);
+      expect(noPayload.body.error.code).toBe("VALIDATION_ERROR");
+
+      // Mengirim email sungguhan ke diri sendiri; hanya jalan bila TEST_SEND=1.
+      if (process.env.TEST_SEND === "1") {
+        const sent = await agent
+          .post("/api/mail/send")
+          .set("X-CSRF-Token", csrf ?? "")
+          .send({
+            to: [TEST_EMAIL],
+            subject: `Tes webmail ${stamp}`,
+            html: "<p>Tes kirim <b>otomatis</b></p><script>alert(1)</script>",
+          });
+        expect(sent.status).toBe(201);
+        expect(sent.body.accepted).toContain(TEST_EMAIL);
+        expect(sent.body.sentCopy).toBe(true);
+
+        const withFile = await agent
+          .post("/api/mail/send")
+          .set("X-CSRF-Token", csrf ?? "")
+          .field(
+            "payload",
+            JSON.stringify({
+              to: [TEST_EMAIL],
+              subject: `Tes lampiran ${stamp}`,
+              text: "Lihat lampiran",
+            }),
+          )
+          .attach("attachments", Buffer.from("isi catatan"), "catatan.txt");
+        expect(withFile.status).toBe(201);
+        expect(withFile.body.accepted).toContain(TEST_EMAIL);
       }
 
       const out = await agent.post("/api/auth/logout");
