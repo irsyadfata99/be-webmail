@@ -2,6 +2,12 @@ import type { FetchMessageObject, ImapFlow } from "imapflow";
 import { withMailbox } from "../../lib/imap-session.js";
 import { AppError } from "../../middleware/error-handler.js";
 import {
+  type AttachmentContent,
+  type ParsedMessage,
+  extractAttachment,
+  parseRawMessage,
+} from "./mail.parse.js";
+import {
   type FolderInfo,
   type MailAddress,
   folderRole,
@@ -95,9 +101,115 @@ export async function listMessages(
   });
 }
 
-async function lockFolder(client: ImapFlow, folder: string) {
+const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+
+export interface MessageDetail extends ParsedMessage {
+  folder: string;
+  uid: number;
+  size: number;
+  seen: boolean;
+  flagged: boolean;
+  answered: boolean;
+  draft: boolean;
+}
+
+export async function getMessage(
+  auth: Express.AuthContext,
+  folder: string,
+  uid: number,
+  options: { images: boolean; markSeen: boolean },
+): Promise<MessageDetail> {
+  return withMailbox(auth, async (client) => {
+    // Kunci baca-saja kecuali pengguna meminta menandai pesan sebagai dibaca.
+    const lock = await lockFolder(client, folder, !options.markSeen);
+    try {
+      const { meta, source } = await loadSource(client, uid);
+
+      const parsed = await parseRawMessage(
+        source,
+        options.images,
+        (index) =>
+          `/api/mail/messages/${uid}/attachments/${index}?folder=${encodeURIComponent(folder)}&inline=1`,
+      );
+      const flags = meta.flags ?? new Set<string>();
+      let seen = flags.has("\\Seen");
+      if (options.markSeen && !seen) {
+        await client.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
+        seen = true;
+      }
+
+      return {
+        ...parsed,
+        folder,
+        uid,
+        size: meta.size ?? 0,
+        seen,
+        flagged: flags.has("\\Flagged"),
+        answered: flags.has("\\Answered"),
+        draft: flags.has("\\Draft"),
+      };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+export async function getAttachment(
+  auth: Express.AuthContext,
+  folder: string,
+  uid: number,
+  index: number,
+): Promise<AttachmentContent> {
+  return withMailbox(auth, async (client) => {
+    const lock = await lockFolder(client, folder);
+    try {
+      const { source } = await loadSource(client, uid);
+      const attachment = await extractAttachment(source, index);
+      if (!attachment) {
+        throw new AppError(
+          404,
+          "ATTACHMENT_NOT_FOUND",
+          "Lampiran tidak ditemukan",
+        );
+      }
+      return attachment;
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/** Mengambil metadata lalu isi mentah pesan; memeriksa batas ukuran sebelum mengunduh. */
+async function loadSource(client: ImapFlow, uid: number) {
+  const meta = await client.fetchOne(
+    String(uid),
+    { uid: true, flags: true, size: true },
+    { uid: true },
+  );
+  if (!meta) {
+    throw new AppError(404, "MESSAGE_NOT_FOUND", "Pesan tidak ditemukan");
+  }
+  if ((meta.size ?? 0) > MAX_MESSAGE_BYTES) {
+    throw new AppError(
+      413,
+      "MESSAGE_TOO_LARGE",
+      "Pesan terlalu besar untuk ditampilkan",
+    );
+  }
+  const full = await client.fetchOne(
+    String(uid),
+    { uid: true, source: true },
+    { uid: true },
+  );
+  if (!full || !full.source) {
+    throw new AppError(404, "MESSAGE_NOT_FOUND", "Pesan tidak ditemukan");
+  }
+  return { meta, source: full.source };
+}
+
+async function lockFolder(client: ImapFlow, folder: string, readOnly = true) {
   try {
-    return await client.getMailboxLock(folder, { readOnly: true });
+    return await client.getMailboxLock(folder, { readOnly });
   } catch (err) {
     throw folderError(err);
   }

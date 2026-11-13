@@ -19,3 +19,30 @@ export const listMessagesQuery = z.object({
 });
 
 export type ListMessagesQuery = z.infer<typeof listMessagesQuery>;
+
+const flag = z
+  .enum(["1", "true", "0", "false"])
+  .optional()
+  .transform((v) => v === "1" || v === "true");
+
+export const messageParams = z.object({
+  uid: z.coerce.number().int().min(1).max(4_294_967_295),
+});
+
+export const getMessageQuery = z.object({
+  folder: listMessagesQuery.shape.folder,
+  images: flag,
+  markSeen: flag,
+});
+
+export type GetMessageQuery = z.infer<typeof getMessageQuery>;
+
+export const attachmentParams = z.object({
+  uid: messageParams.shape.uid,
+  index: z.coerce.number().int().min(0).max(999),
+});
+
+export const attachmentQuery = z.object({
+  folder: listMessagesQuery.shape.folder,
+  inline: flag,
+});

@@ -29,6 +29,16 @@ describe("mail (tanpa sesi)", () => {
     const res = await request(app).get("/api/mail/messages");
     expect(res.status).toBe(401);
   });
+
+  it("mengunduh lampiran tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app).get("/api/mail/messages/1/attachments/0");
+    expect(res.status).toBe(401);
+  });
+
+  it("membuka satu pesan tanpa sesi mengembalikan 401", async () => {
+    const res = await request(app).get("/api/mail/messages/1");
+    expect(res.status).toBe(401);
+  });
 });
 
 describe("mail (dengan sesi)", () => {
@@ -97,6 +107,48 @@ describe("mail (dengan sesi)", () => {
         .query({ folder: `tidak-ada-${stamp}` });
       expect(missing.status).toBe(404);
       expect(missing.body.error.code).toBe("FOLDER_NOT_FOUND");
+
+      const bad = await agent.get("/api/mail/messages/abc");
+      expect(bad.status).toBe(400);
+      expect(bad.body.error.code).toBe("VALIDATION_ERROR");
+
+      const none = await agent
+        .get("/api/mail/messages/4000000000")
+        .query({ folder: "INBOX" });
+      expect(none.status).toBe(404);
+      expect(none.body.error.code).toBe("MESSAGE_NOT_FOUND");
+
+      const first = msgs[0];
+      if (first) {
+        const one = await agent
+          .get(`/api/mail/messages/${first.uid}`)
+          .query({ folder: "INBOX" });
+        expect(one.status).toBe(200);
+        expect(one.headers["cache-control"]).toContain("no-store");
+        expect(one.body.uid).toBe(first.uid);
+        expect(one.body.seen).toBe(first.seen);
+        expect(Array.isArray(one.body.attachments)).toBe(true);
+        expect(typeof one.body.blockedImages).toBe("number");
+        expect(one.body.html ?? "").not.toMatch(/<script/i);
+
+        const noAtt = await agent
+          .get(`/api/mail/messages/${first.uid}/attachments/999`)
+          .query({ folder: "INBOX" });
+        expect(noAtt.status).toBe(404);
+        expect(noAtt.body.error.code).toBe("ATTACHMENT_NOT_FOUND");
+
+        const withFile = (one.body.attachments as Array<{ index: number }>)[0];
+        if (withFile) {
+          const dl = await agent
+            .get(
+              `/api/mail/messages/${first.uid}/attachments/${withFile.index}`,
+            )
+            .query({ folder: "INBOX" });
+          expect(dl.status).toBe(200);
+          expect(dl.headers["content-disposition"]).toContain("attachment");
+          expect(dl.headers["x-content-type-options"]).toBe("nosniff");
+        }
+      }
 
       const out = await agent.post("/api/auth/logout");
       expect(out.status).toBe(204);
