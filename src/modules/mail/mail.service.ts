@@ -1,4 +1,6 @@
 import type { FetchMessageObject, ImapFlow } from "imapflow";
+import { env } from "../../config/env.js";
+import { GateFullError, createGate } from "../../lib/gate.js";
 import { withMailbox } from "../../lib/imap-session.js";
 import { AppError } from "../../middleware/error-handler.js";
 import {
@@ -107,7 +109,15 @@ export async function listMessages(
   });
 }
 
-const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+/** Batas ukuran pesan yang boleh dibuka (dari MAX_MESSAGE_MB; setara batas terima Gmail 50 MB). */
+const MAX_MESSAGE_BYTES = env.MAX_MESSAGE_MB * 1024 * 1024;
+
+/**
+ * Pesan di atas ini diurai paling banyak 2 sekaligus (antrean 10), karena mengurai
+ * pesan besar memakai memori beberapa kali ukurannya.
+ */
+const HEAVY_MESSAGE_BYTES = 10 * 1024 * 1024;
+const heavyGate = createGate(2, 10);
 
 export interface MessageDetail extends ParsedMessage {
   folder: string;
@@ -129,31 +139,31 @@ export async function getMessage(
     // Kunci baca-saja kecuali pengguna meminta menandai pesan sebagai dibaca.
     const lock = await lockFolder(client, folder, !options.markSeen);
     try {
-      const { meta, source } = await loadSource(client, uid);
+      return await withSource(client, uid, async (meta, source) => {
+        const parsed = await parseRawMessage(
+          source,
+          options.images,
+          (index) =>
+            `/api/mail/messages/${uid}/attachments/${index}?folder=${encodeURIComponent(folder)}&inline=1`,
+        );
+        const flags = meta.flags ?? new Set<string>();
+        let seen = flags.has("\\Seen");
+        if (options.markSeen && !seen) {
+          await client.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
+          seen = true;
+        }
 
-      const parsed = await parseRawMessage(
-        source,
-        options.images,
-        (index) =>
-          `/api/mail/messages/${uid}/attachments/${index}?folder=${encodeURIComponent(folder)}&inline=1`,
-      );
-      const flags = meta.flags ?? new Set<string>();
-      let seen = flags.has("\\Seen");
-      if (options.markSeen && !seen) {
-        await client.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
-        seen = true;
-      }
-
-      return {
-        ...parsed,
-        folder,
-        uid,
-        size: meta.size ?? 0,
-        seen,
-        flagged: flags.has("\\Flagged"),
-        answered: flags.has("\\Answered"),
-        draft: flags.has("\\Draft"),
-      };
+        return {
+          ...parsed,
+          folder,
+          uid,
+          size: meta.size ?? 0,
+          seen,
+          flagged: flags.has("\\Flagged"),
+          answered: flags.has("\\Answered"),
+          draft: flags.has("\\Draft"),
+        };
+      });
     } finally {
       lock.release();
     }
@@ -173,9 +183,10 @@ export async function getComposeDraft(
   return withMailbox(auth, async (client) => {
     const lock = await lockFolder(client, folder);
     try {
-      const { source } = await loadSource(client, uid);
-      // Gambar eksternal tetap diblokir pada kutipan.
-      const parsed = await parseRawMessage(source, false);
+      const parsed = await withSource(client, uid, (_meta, source) =>
+        // Gambar eksternal tetap diblokir pada kutipan.
+        parseRawMessage(source, false),
+      );
       const draft = buildComposeDraft(parsed, mode, auth.user.email);
       return {
         ...draft,
@@ -200,8 +211,9 @@ export async function loadForwardAttachments(
   return withMailbox(auth, async (client) => {
     const lock = await lockFolder(client, folder);
     try {
-      const { source } = await loadSource(client, uid);
-      return await extractAllAttachments(source);
+      return await withSource(client, uid, (_meta, source) =>
+        extractAllAttachments(source),
+      );
     } finally {
       lock.release();
     }
@@ -217,8 +229,9 @@ export async function getAttachment(
   return withMailbox(auth, async (client) => {
     const lock = await lockFolder(client, folder);
     try {
-      const { source } = await loadSource(client, uid);
-      const attachment = await extractAttachment(source, index);
+      const attachment = await withSource(client, uid, (_meta, source) =>
+        extractAttachment(source, index),
+      );
       if (!attachment) {
         throw new AppError(
           404,
@@ -233,8 +246,17 @@ export async function getAttachment(
   });
 }
 
-/** Mengambil metadata lalu isi mentah pesan; memeriksa batas ukuran sebelum mengunduh. */
-async function loadSource(client: ImapFlow, uid: number) {
+type MessageMeta = FetchMessageObject;
+
+/**
+ * Mengambil metadata, memeriksa batas ukuran, mengunduh isi mentah, lalu menjalankan `fn`.
+ * Pesan besar melewati `heavyGate` selama diunduh dan diurai, agar memori tidak jebol.
+ */
+async function withSource<T>(
+  client: ImapFlow,
+  uid: number,
+  fn: (meta: MessageMeta, source: Buffer) => Promise<T>,
+): Promise<T> {
   const meta = await client.fetchOne(
     String(uid),
     { uid: true, flags: true, size: true },
@@ -243,22 +265,40 @@ async function loadSource(client: ImapFlow, uid: number) {
   if (!meta) {
     throw new AppError(404, "MESSAGE_NOT_FOUND", "Pesan tidak ditemukan");
   }
-  if ((meta.size ?? 0) > MAX_MESSAGE_BYTES) {
+  const size = meta.size ?? 0;
+  if (size > MAX_MESSAGE_BYTES) {
     throw new AppError(
       413,
       "MESSAGE_TOO_LARGE",
       "Pesan terlalu besar untuk ditampilkan",
     );
   }
-  const full = await client.fetchOne(
-    String(uid),
-    { uid: true, source: true },
-    { uid: true },
-  );
-  if (!full || !full.source) {
-    throw new AppError(404, "MESSAGE_NOT_FOUND", "Pesan tidak ditemukan");
+
+  const run = async (): Promise<T> => {
+    const full = await client.fetchOne(
+      String(uid),
+      { uid: true, source: true },
+      { uid: true },
+    );
+    if (!full || !full.source) {
+      throw new AppError(404, "MESSAGE_NOT_FOUND", "Pesan tidak ditemukan");
+    }
+    return fn(meta, full.source);
+  };
+
+  if (size <= HEAVY_MESSAGE_BYTES) return run();
+  try {
+    return await heavyGate.run(run);
+  } catch (err) {
+    if (err instanceof GateFullError) {
+      throw new AppError(
+        503,
+        "SERVER_BUSY",
+        "Server sedang memproses banyak pesan besar. Coba lagi sebentar lagi.",
+      );
+    }
+    throw err;
   }
-  return { meta, source: full.source };
 }
 
 async function lockFolder(client: ImapFlow, folder: string, readOnly = true) {

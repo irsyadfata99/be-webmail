@@ -83,6 +83,10 @@ const schema = z
       .max(100)
       .default(15),
 
+    // Ukuran pesan terbesar yang boleh dibuka (terima). Setara batas terima Gmail 50 MB;
+    // samakan dengan POSTFIX_MESSAGE_SIZE_LIMIT di mailserver dan message_size_limit di relay VPS.
+    MAX_MESSAGE_MB: z.coerce.number().int().min(1).max(200).default(50),
+
     ADMIN_EMAILS: z
       .string()
       .default("")

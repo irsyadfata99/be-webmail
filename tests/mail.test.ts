@@ -122,6 +122,7 @@ describe("mail (dengan sesi)", () => {
         uid: number;
         subject: string;
         from: unknown[];
+        size: number;
         seen: boolean;
         hasAttachments: boolean;
       }>;
@@ -160,7 +161,8 @@ describe("mail (dengan sesi)", () => {
       expect(none.status).toBe(404);
       expect(none.body.error.code).toBe("MESSAGE_NOT_FOUND");
 
-      const first = msgs[0];
+      // Pesan besar (hasil uji batas 50 MB) dilewati: mengunduhnya berulang membuat tes ini kehabisan waktu.
+      const first = msgs.find((m) => m.size < 1_000_000);
       if (first) {
         const one = await agent
           .get(`/api/mail/messages/${first.uid}`)
