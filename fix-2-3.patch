@@ -1,0 +1,508 @@
+diff --git a/.env.example b/.env.example
+index 35525c8..8f1878f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -34,5 +34,7 @@ COOKIE_SECURE=false
+ COOKIE_DOMAIN=
+ TRUST_PROXY=
+ # --- Lampiran ---
+-# Samakan dengan batas pesan Postfix (bawaan sekitar 10 MB)
+-MAX_ATTACHMENT_MB=10
+\ No newline at end of file
++# Per berkas dan total (ukuran mentah; setelah base64 sekitar 1,37x). Samakan dengan
++# POSTFIX_MESSAGE_SIZE_LIMIT di mailserver, message_size_limit di relay VPS, dan Nginx.
++MAX_ATTACHMENT_MB=10
++MAX_TOTAL_ATTACHMENT_MB=15
+\ No newline at end of file
+diff --git a/src/config/env.ts b/src/config/env.ts
+index da7bb85..318b51e 100644
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -72,7 +72,16 @@ const schema = z
+         return list.length > 0 ? list : undefined;
+       }),
+ 
++    // Batas per berkas dan total lampiran per pesan (ukuran mentah). Setelah base64
++    // ukuran pesan sekitar 1,37x lipat, jadi total dijaga jauh di bawah batas server
++    // dan penerima (Gmail 25 MB). Samakan dengan POSTFIX_MESSAGE_SIZE_LIMIT, relay VPS, dan Nginx.
+     MAX_ATTACHMENT_MB: z.coerce.number().int().min(1).max(100).default(10),
++    MAX_TOTAL_ATTACHMENT_MB: z.coerce
++      .number()
++      .int()
++      .min(1)
++      .max(100)
++      .default(15),
+ 
+     ADMIN_EMAILS: z
+       .string()
+@@ -88,6 +97,10 @@ const schema = z
+     message: "SESSION_SECRET dan CREDENTIAL_ENCRYPTION_KEY tidak boleh sama",
+     path: ["CREDENTIAL_ENCRYPTION_KEY"],
+   })
++  .refine((e) => e.MAX_ATTACHMENT_MB <= e.MAX_TOTAL_ATTACHMENT_MB, {
++    message: "tidak boleh lebih besar dari MAX_TOTAL_ATTACHMENT_MB",
++    path: ["MAX_ATTACHMENT_MB"],
++  })
+   .refine((e) => e.NODE_ENV !== "production" || e.COOKIE_SECURE, {
+     message: "wajib true di production",
+     path: ["COOKIE_SECURE"],
+diff --git a/src/lib/imap-session.ts b/src/lib/imap-session.ts
+index c69c5ce..80a8b76 100644
+--- a/src/lib/imap-session.ts
++++ b/src/lib/imap-session.ts
+@@ -5,6 +5,7 @@ import { CREDENTIAL_CONTEXT } from "../modules/auth/auth.service.js";
+ import { decrypt } from "./crypto.js";
+ import { isAuthFailure } from "./imap.js";
+ import { logger } from "./logger.js";
++import { prisma } from "./prisma.js";
+ 
+ /**
+  * Membuka satu koneksi IMAP atas nama user yang sedang login, menjalankan `fn`,
+@@ -22,6 +23,23 @@ export function decryptCredential(auth: Express.AuthContext): string {
+   }
+ }
+ 
++/**
++ * Mencabut sesi saat server mail menolak password tersimpan (biasanya password
++ * diganti di tempat lain). Tanpa ini, tiap permintaan mengulang login yang gagal.
++ */
++export async function revokeSessionForBadCredential(
++  auth: Express.AuthContext,
++): Promise<void> {
++  try {
++    await prisma.session.updateMany({
++      where: { id: auth.sessionId, revokedAt: null },
++      data: { revokedAt: new Date() },
++    });
++  } catch (err) {
++    logger.warn({ err }, "gagal mencabut sesi dengan kredensial tidak valid");
++  }
++}
++
+ export async function withMailbox<T>(
+   auth: Express.AuthContext,
+   fn: (client: ImapFlow) => Promise<T>,
+@@ -47,6 +65,7 @@ export async function withMailbox<T>(
+       await client.connect();
+     } catch (err) {
+       if (isAuthFailure(err)) {
++        await revokeSessionForBadCredential(auth);
+         throw new AppError(
+           401,
+           "MAIL_CREDENTIAL_INVALID",
+diff --git a/src/modules/mail/mail.attachment.ts b/src/modules/mail/mail.attachment.ts
+index 008f4e8..39009fb 100644
+--- a/src/modules/mail/mail.attachment.ts
++++ b/src/modules/mail/mail.attachment.ts
+@@ -56,7 +56,8 @@ export function normalizeCid(cid: string | undefined | null): string {
+ 
+ /** Batas lampiran keluar. Ukuran per berkas mengikuti MAX_ATTACHMENT_MB di env. */
+ export const MAX_OUTGOING_FILES = 10;
+-export const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
++/** Bawaan total lampiran per pesan; nilai sebenarnya dari MAX_TOTAL_ATTACHMENT_MB di env. */
++export const MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+ 
+ /** Ekstensi yang ditolak untuk lampiran keluar, seperti kebanyakan penyedia email. */
+ const BLOCKED_EXTENSIONS = new Set([
+@@ -140,8 +141,11 @@ export function checkOutgoingAttachments(
+   return null;
+ }
+ 
+-export function checkTotalBytes(totalBytes: number): OutgoingProblem | null {
+-  return totalBytes > MAX_TOTAL_ATTACHMENT_BYTES
++export function checkTotalBytes(
++  totalBytes: number,
++  maxBytes: number = MAX_TOTAL_ATTACHMENT_BYTES,
++): OutgoingProblem | null {
++  return totalBytes > maxBytes
+     ? {
+         status: 413,
+         code: "ATTACHMENTS_TOO_LARGE",
+diff --git a/src/modules/mail/mail.errors.ts b/src/modules/mail/mail.errors.ts
+new file mode 100644
+index 0000000..8ba33fd
+--- /dev/null
++++ b/src/modules/mail/mail.errors.ts
+@@ -0,0 +1,36 @@
++import { logger } from "../../lib/logger.js";
++import { AppError } from "../../middleware/error-handler.js";
++
++/** Memetakan galat SMTP (nodemailer) ke AppError yang aman ditampilkan ke pengguna. */
++export function smtpError(err: unknown): AppError {
++  const e = (err ?? {}) as { code?: string; responseCode?: number };
++
++  if (e.code === "EAUTH") {
++    return new AppError(
++      401,
++      "MAIL_CREDENTIAL_INVALID",
++      "Password email sudah berubah. Silakan login ulang.",
++    );
++  }
++  // 552: pesan melebihi batas ukuran server. Jangan dilaporkan sebagai salah alamat.
++  if (e.responseCode === 552) {
++    return new AppError(
++      413,
++      "MESSAGE_TOO_LARGE",
++      "Ukuran pesan melebihi batas server. Kurangi ukuran lampiran.",
++    );
++  }
++  if (e.code === "EENVELOPE" || (e.responseCode && e.responseCode >= 500)) {
++    return new AppError(
++      422,
++      "RECIPIENT_REJECTED",
++      "Pesan ditolak oleh mail server. Periksa alamat penerima.",
++    );
++  }
++  logger.error({ err }, "gagal mengirim lewat SMTP");
++  return new AppError(
++    503,
++    "MAIL_SERVER_UNAVAILABLE",
++    "Mail server sedang tidak dapat dihubungi. Coba lagi nanti.",
++  );
++}
+diff --git a/src/modules/mail/mail.sanitize.ts b/src/modules/mail/mail.sanitize.ts
+index 269088c..5c145c5 100644
+--- a/src/modules/mail/mail.sanitize.ts
++++ b/src/modules/mail/mail.sanitize.ts
+@@ -23,7 +23,8 @@ const COLOR = [
+   /^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(,\s*[\d.]+\s*)?\)$/i,
+   /^[a-z]{3,30}$/i,
+ ];
+-const LENGTH = [/^-?\d{1,4}(\.\d{1,2})?(px|em|rem|%|pt)?$/i];
++// Tanpa nilai negatif: margin negatif bisa menggeser isi email menimpa tampilan aplikasi.
++const LENGTH = [/^\d{1,4}(\.\d{1,2})?(px|em|rem|%|pt)?$/i];
+ 
+ /**
+  * Gaya inline: hanya properti kosmetik dengan nilai sederhana. Karena nilai
+diff --git a/src/modules/mail/mail.send.ts b/src/modules/mail/mail.send.ts
+index bd80659..24254e0 100644
+--- a/src/modules/mail/mail.send.ts
++++ b/src/modules/mail/mail.send.ts
+@@ -2,8 +2,11 @@ import type { Request } from "express";
+ import nodemailer from "nodemailer";
+ import type { SendMailOptions } from "nodemailer";
+ import { env } from "../../config/env.js";
+-import { writeAudit } from "../../lib/audit.js";
+-import { decryptCredential, withMailbox } from "../../lib/imap-session.js";
++import {
++  decryptCredential,
++  revokeSessionForBadCredential,
++  withMailbox,
++} from "../../lib/imap-session.js";
+ import { logger } from "../../lib/logger.js";
+ import { prisma } from "../../lib/prisma.js";
+ import { AppError } from "../../middleware/error-handler.js";
+@@ -12,6 +15,7 @@ import {
+   allRecipients,
+   buildMailOptions,
+ } from "./mail.compose.js";
++import { smtpError } from "./mail.errors.js";
+ import type { SendBody } from "./mail.schema.js";
+ import {
+   checkOutgoingAttachments,
+@@ -42,47 +46,77 @@ function problemToError(p: OutgoingProblem): AppError {
+ }
+ 
+ export const AUDIT_MAIL_SENT = "MAIL_SENT";
++export const AUDIT_MAIL_SEND_FAILED = "MAIL_SEND_FAILED";
++
++type AuditMeta = Record<string, string | number | boolean | null>;
++
++const SEND_WINDOW_MS = 60 * 60 * 1000;
++
++function tooManySends(): AppError {
++  return new AppError(
++    429,
++    "SEND_LIMIT_REACHED",
++    "Batas pengiriman per jam tercapai. Coba lagi nanti.",
++  );
++}
+ 
++/** Pemeriksaan cepat sebelum pekerjaan berat. Tidak atomik; yang mengikat adalah reserveSendSlot. */
+ async function assertWithinSendLimit(userId: string): Promise<void> {
+-  const since = new Date(Date.now() - 60 * 60 * 1000);
+   const count = await prisma.auditLog.count({
+     where: {
+       actorId: userId,
+       action: AUDIT_MAIL_SENT,
+-      createdAt: { gte: since },
++      createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) },
+     },
+   });
+-  if (count >= SENDS_PER_HOUR) {
+-    throw new AppError(
+-      429,
+-      "SEND_LIMIT_REACHED",
+-      "Batas pengiriman per jam tercapai. Coba lagi nanti.",
+-    );
+-  }
++  if (count >= SENDS_PER_HOUR) throw tooManySends();
+ }
+ 
+-function smtpError(err: unknown): AppError {
+-  const e = err as { code?: string; responseCode?: number };
+-  if (e.code === "EAUTH") {
+-    return new AppError(
+-      401,
+-      "MAIL_CREDENTIAL_INVALID",
+-      "Password email sudah berubah. Silakan login ulang.",
+-    );
+-  }
+-  if (e.code === "EENVELOPE" || (e.responseCode && e.responseCode >= 500)) {
+-    return new AppError(
+-      422,
+-      "RECIPIENT_REJECTED",
+-      "Pesan ditolak oleh mail server. Periksa alamat penerima.",
+-    );
++/**
++ * Memesan satu jatah kirim secara atomik: hitung dan catat dalam satu transaksi
++ * dengan kunci per pengguna, sehingga permintaan paralel tidak bisa melewati batas.
++ * Catatan ini diperbarui setelah kirim (berhasil atau gagal).
++ */
++export async function reserveSendSlot(
++  req: Request,
++  userId: string,
++): Promise<string> {
++  const since = new Date(Date.now() - SEND_WINDOW_MS);
++  return prisma.$transaction(async (tx) => {
++    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${userId}))`;
++    const count = await tx.auditLog.count({
++      where: {
++        actorId: userId,
++        action: AUDIT_MAIL_SENT,
++        createdAt: { gte: since },
++      },
++    });
++    if (count >= SENDS_PER_HOUR) throw tooManySends();
++    const row = await tx.auditLog.create({
++      data: {
++        actorId: userId,
++        action: AUDIT_MAIL_SENT,
++        ipAddress: req.ip ?? null,
++        userAgent: req.get("user-agent")?.slice(0, 300) ?? null,
++        metadata: { pending: true },
++      },
++      select: { id: true },
++    });
++    return row.id;
++  });
++}
++
++/** Menutup catatan jatah kirim. Kegagalan di sini hanya dicatat di log. */
++async function finalizeSendSlot(
++  id: string,
++  action: string,
++  metadata: AuditMeta,
++): Promise<void> {
++  try {
++    await prisma.auditLog.update({ where: { id }, data: { action, metadata } });
++  } catch (err) {
++    logger.error({ err, id }, "gagal memperbarui catatan pengiriman");
+   }
+-  logger.error({ err }, "gagal mengirim lewat SMTP");
+-  return new AppError(
+-    503,
+-    "MAIL_SERVER_UNAVAILABLE",
+-    "Mail server sedang tidak dapat dihubungi. Coba lagi nanti.",
+-  );
+ }
+ 
+ /** Menyimpan salinan ke folder Sent. Kegagalan di sini tidak membatalkan pengiriman. */
+@@ -166,6 +200,7 @@ export async function sendMessage(
+   const attachments = [...uploaded, ...forwarded];
+   const totalProblem = checkTotalBytes(
+     attachments.reduce((sum, f) => sum + f.content.length, 0),
++    env.MAX_TOTAL_ATTACHMENT_MB * 1024 * 1024,
+   );
+   if (totalProblem) throw problemToError(totalProblem);
+ 
+@@ -195,11 +230,15 @@ export async function sendMessage(
+   };
+   const raw = built.message;
+ 
++  // Dekripsi dulu, sebelum jatah kirim dipesan, agar sesi rusak tidak memakai jatah.
++  const password = decryptCredential(auth);
++  const slotId = await reserveSendSlot(req, auth.user.id);
++
+   const transport = nodemailer.createTransport({
+     host: env.SMTP_HOST,
+     port: env.SMTP_PORT,
+     secure: env.SMTP_SECURE,
+-    auth: { user: auth.user.email, pass: decryptCredential(auth) },
++    auth: { user: auth.user.email, pass: password },
+     connectionTimeout: 10_000,
+     greetingTimeout: 10_000,
+     socketTimeout: 30_000,
+@@ -209,7 +248,14 @@ export async function sendMessage(
+   try {
+     info = (await transport.sendMail(options)) as unknown as typeof info;
+   } catch (err) {
+-    throw smtpError(err);
++    const mapped = smtpError(err);
++    await finalizeSendSlot(slotId, AUDIT_MAIL_SEND_FAILED, {
++      reason: mapped.code,
++    });
++    if (mapped.code === "MAIL_CREDENTIAL_INVALID") {
++      await revokeSessionForBadCredential(auth);
++    }
++    throw mapped;
+   } finally {
+     transport.close();
+   }
+@@ -217,15 +263,11 @@ export async function sendMessage(
+   const sentCopy = await saveToSent(auth, raw);
+   if (input.original) await markOriginal(auth, input.original);
+ 
+-  await writeAudit(req, {
+-    actorId: auth.user.id,
+-    action: AUDIT_MAIL_SENT,
+-    metadata: {
+-      recipients: allRecipients(input).length,
+-      hasHtml: Boolean(input.html),
+-      attachments: attachments.length,
+-      sentCopy,
+-    },
++  await finalizeSendSlot(slotId, AUDIT_MAIL_SENT, {
++    recipients: allRecipients(input).length,
++    hasHtml: Boolean(input.html),
++    attachments: attachments.length,
++    sentCopy,
+   });
+ 
+   return {
+diff --git a/tests/mail.attachment.test.ts b/tests/mail.attachment.test.ts
+index 1773ccf..57cfc5e 100644
+--- a/tests/mail.attachment.test.ts
++++ b/tests/mail.attachment.test.ts
+@@ -121,10 +121,17 @@ describe("checkOutgoingAttachments dan checkTotalBytes", () => {
+     );
+   });
+ 
+-  it("total ukuran dibatasi 25 MB", () => {
++  it("total ukuran dibatasi (bawaan 15 MB)", () => {
++    expect(MAX_TOTAL_ATTACHMENT_BYTES).toBe(15 * 1024 * 1024);
+     expect(checkTotalBytes(MAX_TOTAL_ATTACHMENT_BYTES)).toBeNull();
+     expect(checkTotalBytes(MAX_TOTAL_ATTACHMENT_BYTES + 1)?.code).toBe(
+       "ATTACHMENTS_TOO_LARGE",
+     );
+   });
++
++  it("total ukuran mengikuti batas yang diberikan", () => {
++    const max = 5 * 1024 * 1024;
++    expect(checkTotalBytes(max, max)).toBeNull();
++    expect(checkTotalBytes(max + 1, max)?.code).toBe("ATTACHMENTS_TOO_LARGE");
++  });
+ });
+diff --git a/tests/mail.errors.test.ts b/tests/mail.errors.test.ts
+new file mode 100644
+index 0000000..43fe8fa
+--- /dev/null
++++ b/tests/mail.errors.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it } from "vitest";
++import { smtpError } from "../src/modules/mail/mail.errors.js";
++
++describe("smtpError", () => {
++  it("EAUTH berarti kredensial tidak valid (401)", () => {
++    const e = smtpError({ code: "EAUTH" });
++    expect(e.status).toBe(401);
++    expect(e.code).toBe("MAIL_CREDENTIAL_INVALID");
++  });
++
++  it("552 dilaporkan sebagai pesan terlalu besar, bukan salah alamat", () => {
++    const e = smtpError({ responseCode: 552 });
++    expect(e.status).toBe(413);
++    expect(e.code).toBe("MESSAGE_TOO_LARGE");
++  });
++
++  it("penolakan permanen lain dan EENVELOPE berarti penerima ditolak (422)", () => {
++    expect(smtpError({ responseCode: 550 }).code).toBe("RECIPIENT_REJECTED");
++    expect(smtpError({ code: "EENVELOPE" }).code).toBe("RECIPIENT_REJECTED");
++  });
++
++  it("galat lain, termasuk non-objek, menjadi 503", () => {
++    expect(smtpError({ code: "ETIMEDOUT" }).code).toBe(
++      "MAIL_SERVER_UNAVAILABLE",
++    );
++    expect(smtpError(null).status).toBe(503);
++    expect(smtpError(undefined).status).toBe(503);
++  });
++});
+diff --git a/tests/mail.sanitize.test.ts b/tests/mail.sanitize.test.ts
+index c29744a..26967f8 100644
+--- a/tests/mail.sanitize.test.ts
++++ b/tests/mail.sanitize.test.ts
+@@ -39,6 +39,15 @@ describe("sanitizeEmailHtml", () => {
+     expect(html).not.toMatch(/url\(|background-image|position/i);
+   });
+ 
++  it("membuang nilai negatif di style agar isi email tidak menimpa tampilan aplikasi", () => {
++    const { html } = sanitizeEmailHtml(
++      `<p style="margin:-9999px;width:-50px;padding:8px">a</p>`,
++      false,
++    );
++    expect(html).toContain("padding:8px");
++    expect(html).not.toMatch(/margin|width|-9999|-50/i);
++  });
++
+   it("memblokir gambar eksternal secara bawaan dan menghitungnya", () => {
+     const input = `<img src="https://pelacak.example/p.gif" alt="a"><img src="//pelacak.example/q.gif"><img src="cid:logo@x">`;
+     const blocked = sanitizeEmailHtml(input, false);
+diff --git a/tests/send-limit.test.ts b/tests/send-limit.test.ts
+new file mode 100644
+index 0000000..9a3da3b
+--- /dev/null
++++ b/tests/send-limit.test.ts
+@@ -0,0 +1,52 @@
++import type { Request } from "express";
++import { afterAll, describe, expect, it } from "vitest";
++import { disconnectDatabase, prisma } from "../src/lib/prisma.js";
++import { AppError } from "../src/middleware/error-handler.js";
++import { SENDS_PER_HOUR } from "../src/modules/mail/mail.compose.js";
++import { reserveSendSlot } from "../src/modules/mail/mail.send.js";
++
++// Tes ini memakai database dev (seperti app.test.ts) tetapi tidak mengirim email.
++const email = `send-limit-${Date.now()}@example.test`;
++const fakeReq = {
++  ip: "127.0.0.1",
++  get: () => "vitest",
++} as unknown as Request;
++
++afterAll(async () => {
++  const user = await prisma.user.findUnique({ where: { email } });
++  if (user) {
++    await prisma.auditLog.deleteMany({ where: { actorId: user.id } });
++    await prisma.user.delete({ where: { id: user.id } });
++  }
++  await disconnectDatabase();
++});
++
++describe("reserveSendSlot", () => {
++  it("permintaan paralel tidak bisa melewati batas per jam", async () => {
++    const user = await prisma.user.create({
++      data: { email, displayName: "send-limit" },
++    });
++
++    const attempts = SENDS_PER_HOUR + 12;
++    const results = await Promise.allSettled(
++      Array.from({ length: attempts }, () => reserveSendSlot(fakeReq, user.id)),
++    );
++
++    const ok = results.filter((r) => r.status === "fulfilled");
++    const rejected = results.filter(
++      (r): r is PromiseRejectedResult => r.status === "rejected",
++    );
++
++    expect(ok).toHaveLength(SENDS_PER_HOUR);
++    expect(rejected).toHaveLength(attempts - SENDS_PER_HOUR);
++    for (const r of rejected) {
++      expect(r.reason).toBeInstanceOf(AppError);
++      expect((r.reason as AppError).code).toBe("SEND_LIMIT_REACHED");
++    }
++
++    const stored = await prisma.auditLog.count({
++      where: { actorId: user.id, action: "MAIL_SENT" },
++    });
++    expect(stored).toBe(SENDS_PER_HOUR);
++  });
++});
