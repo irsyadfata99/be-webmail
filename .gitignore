@@ -3,3 +3,4 @@ node_modules
 dist
 /generated/prisma
 .env.production
+.env.production
