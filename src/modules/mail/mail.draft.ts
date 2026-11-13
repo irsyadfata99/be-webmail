@@ -31,7 +31,8 @@ import { folderRole } from "./mail.utils.js";
  * bila langkah kedua gagal, hasilnya draf ganda, bukan draf hilang.
  */
 
-const MAX_DRAFT_BYTES = 30 * 1024 * 1024;
+/** Draf boleh sebesar pesan terbesar yang bisa dibuka (MAX_MESSAGE_MB), agar tidak ada draf yang tersimpan tapi tak bisa dibuka. */
+const MAX_DRAFT_BYTES = env.MAX_MESSAGE_MB * 1024 * 1024;
 
 export interface DraftFile {
   filename: string;
