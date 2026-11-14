@@ -41,6 +41,7 @@ export function createApp(): Express {
   );
   // Isi email bisa lebih besar dari 100kb; body-parser melewati bila body sudah terurai.
   app.use("/api/mail/send", express.json({ limit: "2mb" }));
+  app.use("/api/mail/drafts", express.json({ limit: "2mb" }));
   app.use(express.json({ limit: "100kb" }));
   app.use(originGuard);
 

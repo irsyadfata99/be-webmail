@@ -77,6 +77,23 @@ describe("mail (tanpa sesi)", () => {
     expect(res.status).toBe(401);
   });
 
+  it("aksi kelola dan pencarian tanpa sesi mengembalikan 401", async () => {
+    const body = { folder: "INBOX", uids: [1] };
+    const results = await Promise.all([
+      request(app)
+        .patch("/api/mail/messages/flags")
+        .send({ ...body, add: ["seen"] }),
+      request(app)
+        .post("/api/mail/messages/move")
+        .send({ ...body, toRole: "trash" }),
+      request(app).post("/api/mail/messages/delete").send(body),
+      request(app).post("/api/mail/folders/empty").send({ folder: "Trash" }),
+      request(app).get("/api/mail/search").query({ q: "rapat" }),
+      request(app).get("/api/mail/messages/1/thread"),
+    ]);
+    for (const res of results) expect(res.status).toBe(401);
+  });
+
   it("membuka satu pesan tanpa sesi mengembalikan 401", async () => {
     const res = await request(app).get("/api/mail/messages/1");
     expect(res.status).toBe(401);

@@ -14,11 +14,17 @@ import {
   attachmentParams,
   attachmentQuery,
   composeDraftQuery,
+  deleteBody,
   draftBody,
+  emptyFolderBody,
+  flagsBody,
   getMessageQuery,
   listMessagesQuery,
   messageParams,
+  moveBody,
+  searchQuery,
   sendBody,
+  threadQuery,
 } from "./mail.schema.js";
 import {
   MAX_OUTGOING_FILES,
@@ -28,6 +34,14 @@ import {
   safeFilename,
 } from "./mail.attachment.js";
 import { deleteSavedDraft, getSavedDraft, saveDraft } from "./mail.draft.js";
+import {
+  deleteMessages,
+  emptyFolder,
+  getThread,
+  moveMessages,
+  searchMessages,
+  updateFlags,
+} from "./mail.manage.js";
 import { type OutgoingFile, sendMessage } from "./mail.send.js";
 import {
   getAttachment,
@@ -57,6 +71,23 @@ const mailLimiter = rateLimit({
 const draftLimiter = rateLimit({
   windowMs: 60_000,
   limit: 60,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  skip: () => env.NODE_ENV === "test",
+  handler: (_req, _res, next) =>
+    next(
+      new AppError(
+        429,
+        "TOO_MANY_REQUESTS",
+        "Terlalu banyak permintaan. Coba lagi sebentar lagi.",
+      ),
+    ),
+});
+
+// Pencarian (terutama ke semua folder) berat bagi server, jadi dibatasi lebih ketat.
+const searchLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
   standardHeaders: "draft-8",
   legacyHeaders: false,
   skip: () => env.NODE_ENV === "test",
@@ -235,4 +266,66 @@ mailRouter.delete("/drafts/:uid", draftLimiter, async (req, res) => {
   const { uid } = messageParams.parse(req.params);
   await deleteSavedDraft(authOf(req), uid);
   res.status(204).end();
+});
+
+// ---- Modul Kelola ----
+
+// Bintang dan dibaca/belum dibaca, massal (maksimal 100 pesan).
+mailRouter.patch("/messages/flags", async (req, res) => {
+  const body = flagsBody.parse(req.body);
+  const result = await updateFlags(
+    authOf(req),
+    body.folder,
+    body.uids,
+    body.add,
+    body.remove,
+  );
+  res.json(result);
+});
+
+// Pindah, termasuk arsip dan laporan spam (toRole). Hasil memuat peta UID untuk "Batalkan".
+mailRouter.post("/messages/move", async (req, res) => {
+  const body = moveBody.parse(req.body);
+  const result = await moveMessages(authOf(req), body.folder, body.uids, {
+    to: body.to,
+    toRole: body.toRole,
+  });
+  res.json(result);
+});
+
+// Hapus: ke Trash dari folder biasa, selamanya dari Trash, Spam, atau Drafts.
+mailRouter.post("/messages/delete", async (req, res) => {
+  const body = deleteBody.parse(req.body);
+  const result = await deleteMessages(authOf(req), body.folder, body.uids);
+  res.json(result);
+});
+
+// Kosongkan Trash atau Spam.
+mailRouter.post("/folders/empty", async (req, res) => {
+  const body = emptyFolderBody.parse(req.body);
+  const result = await emptyFolder(authOf(req), body.folder);
+  res.json(result);
+});
+
+mailRouter.get("/search", searchLimiter, async (req, res) => {
+  const { q, folder, scope, page, pageSize } = searchQuery.parse(req.query);
+  const result = await searchMessages(
+    authOf(req),
+    q,
+    folder,
+    scope,
+    page,
+    pageSize,
+  );
+  res.set("Cache-Control", "no-store");
+  res.json(result);
+});
+
+// Seluruh percakapan dari satu pesan, urut dari yang terlama.
+mailRouter.get("/messages/:uid/thread", async (req, res) => {
+  const { uid } = messageParams.parse(req.params);
+  const { folder } = threadQuery.parse(req.query);
+  const thread = await getThread(authOf(req), folder, uid);
+  res.set("Cache-Control", "no-store");
+  res.json(thread);
 });

@@ -158,3 +158,77 @@ export const draftBody = z
   });
 
 export type DraftBody = z.infer<typeof draftBody>;
+
+// ---- Modul Kelola ----
+
+const folderPath = z
+  .string()
+  .trim()
+  .min(1)
+  .max(255)
+  .refine(noControlChars, "nama folder tidak valid");
+
+/** Aksi massal dibatasi 100 pesan per permintaan; UID kembar digabung. */
+const uidList = z
+  .array(messageParams.shape.uid)
+  .min(1)
+  .max(100)
+  .transform((uids) => [...new Set(uids)]);
+
+export const FLAG_NAMES = ["seen", "flagged"] as const;
+export type FlagName = (typeof FLAG_NAMES)[number];
+const flagName = z.enum(FLAG_NAMES);
+
+export const flagsBody = z
+  .object({
+    folder: folderPath,
+    uids: uidList,
+    add: z.array(flagName).max(2).default([]),
+    remove: z.array(flagName).max(2).default([]),
+  })
+  .refine((b) => b.add.length + b.remove.length > 0, {
+    message: "isi add atau remove",
+    path: ["add"],
+  })
+  .refine((b) => !b.add.some((f) => b.remove.includes(f)), {
+    message: "flag yang sama tidak boleh ada di add dan remove",
+    path: ["remove"],
+  });
+
+export type FlagsBody = z.infer<typeof flagsBody>;
+
+export const TARGET_ROLES = ["inbox", "spam", "trash", "archive"] as const;
+export type TargetRole = (typeof TARGET_ROLES)[number];
+
+export const moveBody = z
+  .object({
+    folder: folderPath,
+    uids: uidList,
+    to: folderPath.optional(),
+    toRole: z.enum(TARGET_ROLES).optional(),
+  })
+  .refine((b) => (b.to === undefined) !== (b.toRole === undefined), {
+    message: "isi salah satu: to atau toRole",
+    path: ["to"],
+  });
+
+export type MoveBody = z.infer<typeof moveBody>;
+
+export const deleteBody = z.object({ folder: folderPath, uids: uidList });
+
+export const emptyFolderBody = z.object({ folder: folderPath });
+
+export const searchQuery = z.object({
+  q: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .refine(noControlChars, "kata kunci tidak valid"),
+  folder: listMessagesQuery.shape.folder,
+  scope: z.enum(["folder", "all"]).default("folder"),
+  page: listMessagesQuery.shape.page,
+  pageSize: listMessagesQuery.shape.pageSize,
+});
+
+export const threadQuery = z.object({ folder: listMessagesQuery.shape.folder });

@@ -301,7 +301,11 @@ async function withSource<T>(
   }
 }
 
-async function lockFolder(client: ImapFlow, folder: string, readOnly = true) {
+export async function lockFolder(
+  client: ImapFlow,
+  folder: string,
+  readOnly = true,
+) {
   try {
     return await client.getMailboxLock(folder, { readOnly });
   } catch (err) {
@@ -322,7 +326,7 @@ function folderError(err: unknown): unknown {
   return err;
 }
 
-function toSummary(msg: FetchMessageObject): MessageSummary {
+export function toSummary(msg: FetchMessageObject): MessageSummary {
   const flags = msg.flags ?? new Set<string>();
   const envelope = msg.envelope;
   return {
