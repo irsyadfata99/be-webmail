@@ -36,6 +36,11 @@ export interface SendResult {
   sentCopy: boolean;
 }
 
+/** Tambahan internal (bukan dari pengguna), mis. bagian text/calendar untuk undangan. */
+export interface SendExtras {
+  icalEvent?: { method: "REQUEST" | "CANCEL" | "REPLY"; content: string };
+}
+
 export interface OutgoingFile {
   filename: string;
   contentType: string;
@@ -170,6 +175,7 @@ export async function sendMessage(
   auth: Express.AuthContext,
   input: SendBody,
   uploads: OutgoingFile[] = [],
+  extras: SendExtras = {},
 ): Promise<SendResult> {
   const uploaded = uploads.map((f, i) => ({
     ...f,
@@ -231,6 +237,7 @@ export async function sendMessage(
       contentType: downloadContentType(f.contentType),
     }));
   }
+  if (extras.icalEvent) options.icalEvent = extras.icalEvent;
 
   // Salinan untuk Sent dibangun dengan Bcc, yang tidak ikut di pesan yang dikirim.
   const builder = nodemailer.createTransport({

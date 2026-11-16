@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { MAX_OUTGOING_FILES } from "./mail.attachment.js";
 import { MAX_RECIPIENTS } from "./mail.compose.js";
+import { DEFAULT_PAGE_SIZE } from "./mail.page.js";
 
-const noControlChars = (value: string) =>
+export const noControlChars = (value: string) =>
   ![...value].some((ch) => {
     const code = ch.charCodeAt(0);
     return code < 32 || code === 127;
@@ -17,7 +18,8 @@ export const listMessagesQuery = z.object({
     .refine(noControlChars, "nama folder tidak valid")
     .default("INBOX"),
   page: z.coerce.number().int().min(1).max(10_000).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+  // Bawaan Gmail: 50 per halaman. API menerima 1–100; frontend menawarkan PAGE_SIZE_OPTIONS.
+  pageSize: z.coerce.number().int().min(1).max(100).default(DEFAULT_PAGE_SIZE),
 });
 
 export type ListMessagesQuery = z.infer<typeof listMessagesQuery>;
@@ -49,9 +51,14 @@ export const attachmentQuery = z.object({
   inline: flag,
 });
 
-const noLineBreaks = (value: string) => !/[\r\n]/.test(value);
+export const noLineBreaks = (value: string) => !/[\r\n]/.test(value);
 
-const recipient = z.string().trim().toLowerCase().max(254).pipe(z.email());
+export const recipient = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(254)
+  .pipe(z.email());
 
 const messageIdRef = z
   .string()
@@ -161,7 +168,7 @@ export type DraftBody = z.infer<typeof draftBody>;
 
 // ---- Modul Kelola ----
 
-const folderPath = z
+export const folderPath = z
   .string()
   .trim()
   .min(1)

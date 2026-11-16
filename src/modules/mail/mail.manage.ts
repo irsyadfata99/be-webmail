@@ -8,6 +8,7 @@ import {
   type ParsedSearch,
 } from "./mail.search.js";
 import type { FlagName, TargetRole } from "./mail.schema.js";
+import { pageInfo, type PageInfo } from "./mail.page.js";
 import { lockFolder, toSummary, type MessageSummary } from "./mail.service.js";
 import {
   baseSubject,
@@ -310,14 +311,11 @@ export interface SearchHit extends MessageSummary {
   folder: string;
 }
 
-export interface SearchResult {
+export interface SearchResult extends PageInfo {
   q: string;
   scope: "folder" | "all";
-  total: number;
-  page: number;
-  pageSize: number;
-  /** True bila hasil dipotong oleh batas; persempit pencarian untuk hasil lengkap. */
-  truncated: boolean;
+  /** True bila total hanya perkiraan karena dipotong batas ("dari sekitar N" di Gmail). */
+  totalIsEstimate: boolean;
   messages: SearchHit[];
 }
 
@@ -426,10 +424,8 @@ export async function searchMessages(
       return {
         q,
         scope,
-        total: found.total,
-        page,
-        pageSize,
-        truncated: found.truncated,
+        ...pageInfo(found.total, page, pageSize),
+        totalIsEstimate: found.truncated,
         messages: found.summaries.map((m) => ({ ...m, folder })),
       };
     }
@@ -456,10 +452,8 @@ export async function searchMessages(
     return {
       q,
       scope,
-      total: capped.length,
-      page,
-      pageSize,
-      truncated,
+      ...pageInfo(capped.length, page, pageSize),
+      totalIsEstimate: truncated,
       messages: capped.slice(start, start + pageSize),
     };
   });

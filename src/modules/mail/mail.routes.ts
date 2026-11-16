@@ -35,6 +35,19 @@ import {
 } from "./mail.attachment.js";
 import { deleteSavedDraft, getSavedDraft, saveDraft } from "./mail.draft.js";
 import {
+  cancelInvitation,
+  createInvitation,
+  respondToInvitation,
+  updateInvitation,
+} from "../calendar/calendar.service.js";
+import {
+  eventUidParams,
+  invitationBody,
+  invitationUpdateBody,
+  rsvpBody,
+  rsvpParams,
+} from "../calendar/calendar.schema.js";
+import {
   deleteMessages,
   emptyFolder,
   getThread,
@@ -328,4 +341,43 @@ mailRouter.get("/messages/:uid/thread", async (req, res) => {
   const thread = await getThread(authOf(req), folder, uid);
   res.set("Cache-Control", "no-store");
   res.json(thread);
+});
+
+// ---- Undangan kalender (Meet/ICS) ----
+
+// Undangan dikirim sebagai email dengan bagian text/calendar dan lampiran invite.ics.
+// Tautan rapat diisi manual lewat meetUrl (Google Meet, Zoom, dan sejenisnya).
+mailRouter.post("/invitations", async (req, res) => {
+  const body = invitationBody.parse(req.body);
+  const result = await createInvitation(req, authOf(req), body);
+  res.status(201).json(result);
+});
+
+// Ubah: kirim ulang seluruh isi acara dengan sequence terakhir; server menaikkannya satu.
+mailRouter.put("/invitations/:eventUid", async (req, res) => {
+  const { eventUid } = eventUidParams.parse(req.params);
+  const body = invitationUpdateBody.parse(req.body);
+  res.json(await updateInvitation(req, authOf(req), eventUid, body));
+});
+
+mailRouter.post("/invitations/:eventUid/cancel", async (req, res) => {
+  const { eventUid } = eventUidParams.parse(req.params);
+  const body = invitationUpdateBody.parse(req.body);
+  res.json(await cancelInvitation(req, authOf(req), eventUid, body));
+});
+
+// Balas undangan masuk: accepted, declined, atau tentative.
+mailRouter.post("/messages/:uid/rsvp", async (req, res) => {
+  const { uid } = rsvpParams.parse(req.params);
+  const body = rsvpBody.parse(req.body);
+  res.json(
+    await respondToInvitation(
+      req,
+      authOf(req),
+      body.folder,
+      uid,
+      body.response,
+      body.comment,
+    ),
+  );
 });

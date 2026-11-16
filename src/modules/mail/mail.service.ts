@@ -1,3 +1,5 @@
+import { type RsvpResponse, rsvpFromFlags } from "../calendar/calendar.ics.js";
+import { type PageInfo, pageInfo } from "./mail.page.js";
 import type { FetchMessageObject, ImapFlow } from "imapflow";
 import { env } from "../../config/env.js";
 import { GateFullError, createGate } from "../../lib/gate.js";
@@ -40,11 +42,8 @@ export interface MessageSummary {
   hasAttachments: boolean;
 }
 
-export interface MessagePage {
+export interface MessagePage extends PageInfo {
   folder: string;
-  total: number;
-  page: number;
-  pageSize: number;
   messages: MessageSummary[];
 }
 
@@ -86,8 +85,9 @@ export async function listMessages(
     try {
       const mailbox = client.mailbox;
       const total = mailbox ? mailbox.exists : 0;
+      const info = pageInfo(total, page, pageSize);
       const range = pageRange(total, page, pageSize);
-      if (!range) return { folder, total, page, pageSize, messages: [] };
+      if (!range) return { folder, ...info, messages: [] };
 
       const messages: MessageSummary[] = [];
       for await (const msg of client.fetch(`${range.low}:${range.high}`, {
@@ -102,7 +102,7 @@ export async function listMessages(
       }
       messages.sort((a, b) => b.uid - a.uid);
 
-      return { folder, total, page, pageSize, messages };
+      return { folder, ...info, messages };
     } finally {
       lock.release();
     }
@@ -127,6 +127,8 @@ export interface MessageDetail extends ParsedMessage {
   flagged: boolean;
   answered: boolean;
   draft: boolean;
+  /** Jawaban Anda atas undangan di pesan ini, bila sudah membalas. */
+  rsvp: RsvpResponse | null;
 }
 
 export async function getMessage(
@@ -162,6 +164,7 @@ export async function getMessage(
           flagged: flags.has("\\Flagged"),
           answered: flags.has("\\Answered"),
           draft: flags.has("\\Draft"),
+          rsvp: rsvpFromFlags(flags),
         };
       });
     } finally {
@@ -213,6 +216,24 @@ export async function loadForwardAttachments(
     try {
       return await withSource(client, uid, (_meta, source) =>
         extractAllAttachments(source),
+      );
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/** Pesan mentah beserta bendera, untuk modul lain (mis. undangan kalender). */
+export async function loadMessageSource(
+  auth: Express.AuthContext,
+  folder: string,
+  uid: number,
+): Promise<{ source: Buffer; flags: Set<string> }> {
+  return withMailbox(auth, async (client) => {
+    const lock = await lockFolder(client, folder);
+    try {
+      return await withSource(client, uid, (meta, source) =>
+        Promise.resolve({ source, flags: meta.flags ?? new Set<string>() }),
       );
     } finally {
       lock.release();

@@ -1,4 +1,5 @@
 import { type AddressObject, type ParsedMail, simpleParser } from "mailparser";
+import { type Invitation, findInvitation } from "../calendar/calendar.ics.js";
 import { isInlineImageType, normalizeCid } from "./mail.attachment.js";
 import { sanitizeEmailHtml } from "./mail.sanitize.js";
 import { type MailAddress, toAddresses, toIso } from "./mail.utils.js";
@@ -28,6 +29,8 @@ export interface ParsedMessage {
   html: string | null;
   blockedImages: number;
   attachments: AttachmentInfo[];
+  /** Undangan kalender (text/calendar atau .ics) bila pesan memuatnya. */
+  invitation?: Invitation | null;
 }
 
 function addressesOf(
@@ -92,6 +95,7 @@ export function toParsedMessage(
       inline: a.contentDisposition === "inline" || a.related === true,
       cid: a.cid ?? null,
     })),
+    invitation: findInvitation(mail.attachments),
   };
 }
 

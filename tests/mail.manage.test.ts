@@ -120,7 +120,7 @@ describe("searchQuery / threadQuery", () => {
       folder: "INBOX",
       scope: "folder",
       page: 1,
-      pageSize: 25,
+      pageSize: 50,
     });
     expect(threadQuery.parse({}).folder).toBe("INBOX");
   });

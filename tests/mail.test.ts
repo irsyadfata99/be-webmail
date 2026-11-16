@@ -94,6 +94,18 @@ describe("mail (tanpa sesi)", () => {
     for (const res of results) expect(res.status).toBe(401);
   });
 
+  it("undangan dan RSVP tanpa sesi mengembalikan 401", async () => {
+    const results = await Promise.all([
+      request(app).post("/api/mail/invitations").send({}),
+      request(app).put("/api/mail/invitations/abc@x.id").send({}),
+      request(app).post("/api/mail/invitations/abc@x.id/cancel").send({}),
+      request(app)
+        .post("/api/mail/messages/1/rsvp")
+        .send({ folder: "INBOX", response: "accepted" }),
+    ]);
+    for (const res of results) expect(res.status).toBe(401);
+  });
+
   it("membuka satu pesan tanpa sesi mengembalikan 401", async () => {
     const res = await request(app).get("/api/mail/messages/1");
     expect(res.status).toBe(401);
