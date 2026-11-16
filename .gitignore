@@ -4,3 +4,4 @@ dist
 /generated/prisma
 .env.production
 .env.production
+.env.agent

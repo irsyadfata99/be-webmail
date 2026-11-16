@@ -19,6 +19,27 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  account-agent:
+    build:
+      context: ./agent
+    image: mailweb-account-agent:1
+    container_name: mailweb-account-agent
+    restart: always
+    env_file:
+      - .env.agent
+    networks:
+      - mailweb-net
+    volumes:
+      - /share/Container/mailserver/config:/config
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   mailweb-net:
     external: true

@@ -1,0 +1,16 @@
+{
+  "name": "account-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Layanan kecil pengelola akun docker-mailserver (postfix-accounts.cf dan dovecot-quotas.cf)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "test": "node --test test/*.check.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "license": "ISC"
+}

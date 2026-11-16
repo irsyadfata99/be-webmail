@@ -1,46 +1,38 @@
-import { createApp } from "./app.js";
-import { env } from "./config/env.js";
-import { logger } from "./lib/logger.js";
-import { disconnectDatabase } from "./lib/prisma.js";
-import { startCleanupJob } from "./modules/auth/cleanup.js";
+import { createAgentApp } from "./app.ts";
+import { type AgentConfig, loadConfig } from "./config.ts";
+import { AccountStore } from "./store.ts";
 
-const app = createApp();
-
-const server = app.listen(env.PORT, () => {
-  logger.info({ port: env.PORT, env: env.NODE_ENV }, "server berjalan");
-});
-
-const cleanupTimer = startCleanupJob();
-
-let shuttingDown = false;
-
-function shutdown(signal: string): void {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  logger.info({ signal }, "menutup server");
-  clearInterval(cleanupTimer);
-
-  const force = setTimeout(() => {
-    logger.error("shutdown terlalu lama, keluar paksa");
+function main(): void {
+  let config: AgentConfig;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    console.error((err as Error).message);
     process.exit(1);
-  }, 10_000);
-  force.unref();
+  }
 
-  server.close((err) => {
-    if (err) logger.error({ err }, "gagal menutup server");
-    disconnectDatabase()
-      .catch((e: unknown) => logger.error({ err: e }, "gagal menutup database"))
-      .finally(() => process.exit(err ? 1 : 0));
+  const server = createAgentApp(config, new AccountStore(config.configDir));
+  server.listen(config.port, config.host, () => {
+    console.log(
+      JSON.stringify({
+        msg: "account-agent berjalan",
+        port: config.port,
+        domain: config.domain,
+      }),
+    );
   });
+
+  let closing = false;
+  const shutdown = (signal: string): void => {
+    if (closing) return;
+    closing = true;
+    console.log(JSON.stringify({ msg: "menutup layanan", signal }));
+    const force = setTimeout(() => process.exit(1), 5000);
+    force.unref();
+    server.close(() => process.exit(0));
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("unhandledRejection", (reason) => {
-  logger.fatal({ err: reason }, "unhandledRejection");
-  process.exit(1);
-});
-process.on("uncaughtException", (err) => {
-  logger.fatal({ err }, "uncaughtException");
-  process.exit(1);
-});
+main();

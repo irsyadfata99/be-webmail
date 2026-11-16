@@ -1,0 +1,1282 @@
+diff --git a/.dockerignore b/.dockerignore
+index f64b34b..514f920 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -8,4 +8,5 @@ tests
+ !.env.example
+ *.log
+ Dockerfile
+-docker-compose.yml
+\ No newline at end of file
++docker-compose.yml
++agent
+diff --git a/.gitignore b/.gitignore
+index 8d28b26..febd640 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,3 +4,4 @@ dist
+ /generated/prisma
+ .env.production
+ .env.production
++.env.agent
+diff --git a/agent/.dockerignore b/agent/.dockerignore
+new file mode 100644
+index 0000000..12dc0fa
+--- /dev/null
++++ b/agent/.dockerignore
+@@ -0,0 +1,6 @@
++node_modules
++test
++.env
++.env.*
++Dockerfile
++tsconfig.json
+diff --git a/agent/Dockerfile b/agent/Dockerfile
+new file mode 100644
+index 0000000..72dfd3f
+--- /dev/null
++++ b/agent/Dockerfile
+@@ -0,0 +1,15 @@
++ARG NODE_VERSION=24
++
++FROM node:${NODE_VERSION}-bookworm-slim
++ENV NODE_ENV=production
++# openssl dipakai untuk membuat hash SHA512-CRYPT (password dikirim lewat stdin, bukan argumen).
++RUN apt-get update \
++ && apt-get install -y --no-install-recommends openssl \
++ && rm -rf /var/lib/apt/lists/*
++WORKDIR /app
++COPY package.json ./
++COPY src ./src
++EXPOSE 4000
++HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
++  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
++CMD ["node", "src/server.ts"]
+diff --git a/agent/package.json b/agent/package.json
+new file mode 100644
+index 0000000..9623e21
+--- /dev/null
++++ b/agent/package.json
+@@ -0,0 +1,16 @@
++{
++  "name": "account-agent",
++  "version": "1.0.0",
++  "private": true,
++  "description": "Layanan kecil pengelola akun docker-mailserver (postfix-accounts.cf dan dovecot-quotas.cf)",
++  "type": "module",
++  "engines": {
++    "node": ">=22.18"
++  },
++  "scripts": {
++    "start": "node src/server.ts",
++    "test": "node --test test/*.check.ts",
++    "typecheck": "tsc -p tsconfig.json"
++  },
++  "license": "ISC"
++}
+diff --git a/agent/src/app.ts b/agent/src/app.ts
+new file mode 100644
+index 0000000..4b26374
+--- /dev/null
++++ b/agent/src/app.ts
+@@ -0,0 +1,230 @@
++import { createHash, timingSafeEqual } from "node:crypto";
++import {
++  createServer,
++  type IncomingMessage,
++  type Server,
++  type ServerResponse,
++} from "node:http";
++import type { AgentConfig } from "./config.ts";
++import { type AccountStore, StoreError } from "./store.ts";
++import { normalizeEmail, parseQuota, passwordProblem } from "./validate.ts";
++
++const MAX_BODY_BYTES = 10 * 1024;
++
++class HttpError extends Error {
++  status: number;
++  code: string;
++
++  constructor(status: number, code: string, message: string) {
++    super(message);
++    this.name = "HttpError";
++    this.status = status;
++    this.code = code;
++  }
++}
++
++function digest(value: string): Buffer {
++  return createHash("sha256").update(value).digest();
++}
++
++function isAuthorized(req: IncomingMessage, token: string): boolean {
++  const match = /^Bearer (.+)$/.exec(req.headers.authorization ?? "");
++  if (!match) return false;
++  return timingSafeEqual(digest(match[1] ?? ""), digest(token));
++}
++
++function send(res: ServerResponse, status: number, body: unknown): void {
++  const payload = JSON.stringify(body);
++  res.writeHead(status, {
++    "Content-Type": "application/json; charset=utf-8",
++    "Content-Length": Buffer.byteLength(payload),
++    "Cache-Control": "no-store",
++    "X-Content-Type-Options": "nosniff",
++  });
++  res.end(payload);
++}
++
++async function readJson(
++  req: IncomingMessage,
++): Promise<Record<string, unknown>> {
++  const type = (req.headers["content-type"] ?? "").toLowerCase();
++  if (!type.startsWith("application/json")) {
++    throw new HttpError(
++      415,
++      "UNSUPPORTED_MEDIA_TYPE",
++      "Content-Type harus application/json",
++    );
++  }
++  const chunks: Buffer[] = [];
++  let size = 0;
++  for await (const chunk of req) {
++    const buf = chunk as Buffer;
++    size += buf.length;
++    if (size > MAX_BODY_BYTES) {
++      throw new HttpError(413, "PAYLOAD_TOO_LARGE", "Data terlalu besar");
++    }
++    chunks.push(buf);
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
++  } catch {
++    throw new HttpError(400, "BAD_JSON", "Format JSON tidak valid");
++  }
++  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
++    throw new HttpError(400, "BAD_JSON", "Isi harus berupa objek JSON");
++  }
++  return parsed as Record<string, unknown>;
++}
++
++function emailParam(raw: string, domain: string): string {
++  let decoded: string;
++  try {
++    decoded = decodeURIComponent(raw);
++  } catch {
++    throw new HttpError(400, "INVALID_EMAIL", "Email tidak valid");
++  }
++  const email = normalizeEmail(decoded, domain);
++  if (!email) throw new HttpError(400, "INVALID_EMAIL", "Email tidak valid");
++  return email;
++}
++
++function passwordField(body: Record<string, unknown>): string {
++  const problem = passwordProblem(body.password);
++  if (problem) throw new HttpError(400, "INVALID_PASSWORD", problem);
++  return body.password as string;
++}
++
++async function route(
++  req: IncomingMessage,
++  res: ServerResponse,
++  config: AgentConfig,
++  store: AccountStore,
++): Promise<number> {
++  const method = req.method ?? "GET";
++  const path = new URL(req.url ?? "/", "http://agent").pathname;
++
++  if (path === "/health" && method === "GET") {
++    send(res, 200, { ok: true });
++    return 200;
++  }
++
++  if (!isAuthorized(req, config.token)) {
++    throw new HttpError(401, "UNAUTHORIZED", "Token tidak valid");
++  }
++
++  if (path === "/accounts") {
++    if (method === "GET") {
++      send(res, 200, { accounts: await store.list() });
++      return 200;
++    }
++    if (method === "POST") {
++      const body = await readJson(req);
++      const email = normalizeEmail(body.email, config.domain);
++      if (!email)
++        throw new HttpError(400, "INVALID_EMAIL", "Email tidak valid");
++      await store.create(email, passwordField(body));
++      send(res, 201, { email });
++      return 201;
++    }
++    throw new HttpError(405, "METHOD_NOT_ALLOWED", "Metode tidak diizinkan");
++  }
++
++  const match = /^\/accounts\/([^/]+)(\/password|\/quota)?$/.exec(path);
++  if (match) {
++    const email = emailParam(match[1] ?? "", config.domain);
++    const sub = match[2];
++
++    if (sub === "/password") {
++      if (method !== "PUT") {
++        throw new HttpError(
++          405,
++          "METHOD_NOT_ALLOWED",
++          "Metode tidak diizinkan",
++        );
++      }
++      await store.setPassword(email, passwordField(await readJson(req)));
++      send(res, 200, { email });
++      return 200;
++    }
++
++    if (sub === "/quota") {
++      if (method !== "PUT") {
++        throw new HttpError(
++          405,
++          "METHOD_NOT_ALLOWED",
++          "Metode tidak diizinkan",
++        );
++      }
++      const body = await readJson(req);
++      const quota = parseQuota(body.quota);
++      if (!quota.ok) {
++        throw new HttpError(
++          400,
++          "INVALID_QUOTA",
++          "Kuota harus berbentuk seperti 500M atau 2G, atau null",
++        );
++      }
++      await store.setQuota(email, quota.value);
++      send(res, 200, { email, quota: quota.value });
++      return 200;
++    }
++
++    if (method === "DELETE") {
++      await store.remove(email);
++      send(res, 200, { email });
++      return 200;
++    }
++    throw new HttpError(405, "METHOD_NOT_ALLOWED", "Metode tidak diizinkan");
++  }
++
++  throw new HttpError(404, "NOT_FOUND", "Rute tidak ditemukan");
++}
++
++export function createAgentApp(
++  config: AgentConfig,
++  store: AccountStore,
++): Server {
++  const server = createServer((req, res) => {
++    const started = Date.now();
++    route(req, res, config, store)
++      .then((status) => log(req, status, started))
++      .catch((err: unknown) => {
++        let status = 500;
++        let code = "INTERNAL_ERROR";
++        let message = "Terjadi kesalahan pada layanan";
++        if (err instanceof HttpError || err instanceof StoreError) {
++          status = err.status;
++          code = err.code;
++          message = err.message;
++        } else {
++          console.error(
++            JSON.stringify({
++              level: "error",
++              msg: "kesalahan tak terduga",
++              error: String(err),
++            }),
++          );
++        }
++        if (status === 413) res.setHeader("Connection", "close");
++        if (!res.headersSent) send(res, status, { error: { code, message } });
++        log(req, status, started);
++      });
++  });
++  server.requestTimeout = 15_000;
++  server.headersTimeout = 10_000;
++  return server;
++}
++
++function log(req: IncomingMessage, status: number, started: number): void {
++  if (req.url === "/health") return;
++  const path = new URL(req.url ?? "/", "http://agent").pathname;
++  console.log(
++    JSON.stringify({
++      method: req.method,
++      path,
++      status,
++      ms: Date.now() - started,
++    }),
++  );
++}
+diff --git a/agent/src/config.ts b/agent/src/config.ts
+new file mode 100644
+index 0000000..2b4d7ef
+--- /dev/null
++++ b/agent/src/config.ts
+@@ -0,0 +1,36 @@
++export interface AgentConfig {
++  token: string;
++  domain: string;
++  configDir: string;
++  port: number;
++  host: string;
++}
++
++/** Membaca dan memvalidasi konfigurasi. Pesan galat hanya menyebut nama variabel, tidak nilainya. */
++export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
++  const problems: string[] = [];
++
++  const token = env.AGENT_TOKEN ?? "";
++  if (!/^[0-9a-f]{64}$/i.test(token)) {
++    problems.push("AGENT_TOKEN: harus 64 karakter hex (32 byte)");
++  }
++
++  const domain = (env.MAIL_DOMAIN ?? "").trim().toLowerCase();
++  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) {
++    problems.push("MAIL_DOMAIN: domain tidak valid");
++  }
++
++  const port = Number(env.PORT ?? 4000);
++  if (!Number.isInteger(port) || port < 0 || port > 65535) {
++    problems.push("PORT: tidak valid");
++  }
++
++  const configDir = (env.CONFIG_DIR ?? "/config").trim();
++  if (configDir.length === 0) problems.push("CONFIG_DIR: tidak boleh kosong");
++
++  if (problems.length > 0) {
++    throw new Error(`Konfigurasi tidak valid:\n  - ${problems.join("\n  - ")}`);
++  }
++
++  return { token, domain, configDir, port, host: env.HOST ?? "0.0.0.0" };
++}
+diff --git a/agent/src/hash.ts b/agent/src/hash.ts
+new file mode 100644
+index 0000000..71556bf
+--- /dev/null
++++ b/agent/src/hash.ts
+@@ -0,0 +1,42 @@
++import { spawn } from "node:child_process";
++
++const SHA512_CRYPT = /^\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$/;
++const TIMEOUT_MS = 5000;
++
++/**
++ * Membuat hash SHA512-CRYPT ($6$...) yang dipakai Dovecot, lewat `openssl passwd -6`.
++ * Password dikirim lewat stdin supaya tidak terlihat di daftar proses.
++ */
++export function hashPassword(
++  password: string,
++  opensslPath = "openssl",
++): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const child = spawn(opensslPath, ["passwd", "-6", "-stdin"], {
++      stdio: ["pipe", "pipe", "ignore"],
++    });
++    let out = "";
++    const timer = setTimeout(() => {
++      child.kill("SIGKILL");
++      reject(new Error("openssl melebihi batas waktu"));
++    }, TIMEOUT_MS);
++
++    child.stdout.on("data", (chunk: Buffer) => {
++      out += chunk.toString("utf8");
++    });
++    child.on("error", (err) => {
++      clearTimeout(timer);
++      reject(err);
++    });
++    child.on("close", (code) => {
++      clearTimeout(timer);
++      const hash = out.trim();
++      if (code === 0 && SHA512_CRYPT.test(hash)) resolve(hash);
++      else reject(new Error("openssl gagal membuat hash"));
++    });
++    child.stdin.on("error", () => {
++      // Galat tulis ke stdin ditangani lewat event close/error proses.
++    });
++    child.stdin.end(`${password}\n`);
++  });
++}
+diff --git a/agent/src/server.ts b/agent/src/server.ts
+new file mode 100644
+index 0000000..30a7d4c
+--- /dev/null
++++ b/agent/src/server.ts
+@@ -0,0 +1,38 @@
++import { createAgentApp } from "./app.ts";
++import { type AgentConfig, loadConfig } from "./config.ts";
++import { AccountStore } from "./store.ts";
++
++function main(): void {
++  let config: AgentConfig;
++  try {
++    config = loadConfig();
++  } catch (err) {
++    console.error((err as Error).message);
++    process.exit(1);
++  }
++
++  const server = createAgentApp(config, new AccountStore(config.configDir));
++  server.listen(config.port, config.host, () => {
++    console.log(
++      JSON.stringify({
++        msg: "account-agent berjalan",
++        port: config.port,
++        domain: config.domain,
++      }),
++    );
++  });
++
++  let closing = false;
++  const shutdown = (signal: string): void => {
++    if (closing) return;
++    closing = true;
++    console.log(JSON.stringify({ msg: "menutup layanan", signal }));
++    const force = setTimeout(() => process.exit(1), 5000);
++    force.unref();
++    server.close(() => process.exit(0));
++  };
++  process.on("SIGINT", () => shutdown("SIGINT"));
++  process.on("SIGTERM", () => shutdown("SIGTERM"));
++}
++
++main();
+diff --git a/agent/src/store.ts b/agent/src/store.ts
+new file mode 100644
+index 0000000..6704964
+--- /dev/null
++++ b/agent/src/store.ts
+@@ -0,0 +1,208 @@
++import { randomBytes } from "node:crypto";
++import { copyFile, open, readFile, rename, rm, stat } from "node:fs/promises";
++import { join } from "node:path";
++import { hashPassword } from "./hash.ts";
++
++export class StoreError extends Error {
++  status: number;
++  code: string;
++
++  constructor(status: number, code: string, message: string) {
++    super(message);
++    this.name = "StoreError";
++    this.status = status;
++    this.code = code;
++  }
++}
++
++export interface AccountInfo {
++  email: string;
++  quota: string | null;
++}
++
++const ACCOUNTS_FILE = "postfix-accounts.cf";
++const QUOTAS_FILE = "dovecot-quotas.cf";
++
++function isNotFound(err: unknown): boolean {
++  return (
++    typeof err === "object" &&
++    err !== null &&
++    (err as { code?: string }).code === "ENOENT"
++  );
++}
++
++async function readText(path: string): Promise<string> {
++  try {
++    return await readFile(path, "utf8");
++  } catch (err) {
++    if (isNotFound(err)) return "";
++    throw err;
++  }
++}
++
++function toLines(text: string): string[] {
++  const lines = text.split("\n").map((l) => l.replace(/\r$/, ""));
++  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
++  return lines;
++}
++
++function fromLines(lines: string[]): string {
++  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
++}
++
++/** Email pada baris `email|{SCHEME}hash`; null untuk komentar atau baris asing. */
++function accountOf(line: string): string | null {
++  if (line.trimStart().startsWith("#")) return null;
++  const i = line.indexOf("|");
++  if (i < 1) return null;
++  return line.slice(0, i).trim().toLowerCase();
++}
++
++/** Email pada baris `email:kuota`; null untuk komentar atau baris asing. */
++function quotaOf(line: string): string | null {
++  if (line.trimStart().startsWith("#")) return null;
++  const i = line.lastIndexOf(":");
++  if (i < 1) return null;
++  return line.slice(0, i).trim().toLowerCase();
++}
++
++function quotaValue(line: string): string {
++  return line.slice(line.lastIndexOf(":") + 1).trim();
++}
++
++/**
++ * Menulis berkas secara atomik: tulis ke berkas sementara di folder yang sama,
++ * sync, lalu rename. Salinan versi sebelumnya disimpan sebagai `<nama>.bak`.
++ */
++async function writeAtomic(path: string, content: string): Promise<void> {
++  let mode = 0o644;
++  try {
++    mode = (await stat(path)).mode & 0o777;
++    await copyFile(path, `${path}.bak`);
++  } catch (err) {
++    if (!isNotFound(err)) throw err;
++  }
++
++  const tmp = `${path}.${randomBytes(6).toString("hex")}.tmp`;
++  try {
++    const handle = await open(tmp, "w", mode);
++    try {
++      await handle.writeFile(content, "utf8");
++      await handle.sync();
++    } finally {
++      await handle.close();
++    }
++    await rename(tmp, path);
++  } catch (err) {
++    await rm(tmp, { force: true });
++    throw err;
++  }
++}
++
++const notFound = () =>
++  new StoreError(404, "ACCOUNT_NOT_FOUND", "Akun tidak ditemukan");
++
++/**
++ * Pengelola akun berbasis berkas konfigurasi docker-mailserver. Perubahan dideteksi
++ * dan dimuat otomatis oleh docker-mailserver, tanpa akses ke Docker.
++ * Semua penulisan diserialkan dalam satu antrean.
++ */
++export class AccountStore {
++  #dir: string;
++  #queue: Promise<unknown> = Promise.resolve();
++
++  constructor(configDir: string) {
++    this.#dir = configDir;
++  }
++
++  #path(name: string): string {
++    return join(this.#dir, name);
++  }
++
++  #serial<T>(fn: () => Promise<T>): Promise<T> {
++    const next = this.#queue.then(fn);
++    this.#queue = next.catch(() => undefined);
++    return next;
++  }
++
++  async list(): Promise<AccountInfo[]> {
++    const [accounts, quotas] = await Promise.all([
++      readText(this.#path(ACCOUNTS_FILE)),
++      readText(this.#path(QUOTAS_FILE)),
++    ]);
++
++    const quotaByEmail = new Map<string, string>();
++    for (const line of toLines(quotas)) {
++      const email = quotaOf(line);
++      if (email) quotaByEmail.set(email, quotaValue(line));
++    }
++
++    const result: AccountInfo[] = [];
++    for (const line of toLines(accounts)) {
++      const email = accountOf(line);
++      if (email) result.push({ email, quota: quotaByEmail.get(email) ?? null });
++    }
++    return result.sort((a, b) => a.email.localeCompare(b.email));
++  }
++
++  async create(email: string, password: string): Promise<void> {
++    const hash = await hashPassword(password);
++    await this.#serial(async () => {
++      const path = this.#path(ACCOUNTS_FILE);
++      const lines = toLines(await readText(path));
++      if (lines.some((l) => accountOf(l) === email)) {
++        throw new StoreError(409, "ACCOUNT_EXISTS", "Akun sudah ada");
++      }
++      lines.push(`${email}|{SHA512-CRYPT}${hash}`);
++      await writeAtomic(path, fromLines(lines));
++    });
++  }
++
++  async setPassword(email: string, password: string): Promise<void> {
++    const hash = await hashPassword(password);
++    await this.#serial(async () => {
++      const path = this.#path(ACCOUNTS_FILE);
++      const lines = toLines(await readText(path));
++      let found = false;
++      const next = lines.map((line) => {
++        if (accountOf(line) !== email) return line;
++        found = true;
++        return `${email}|{SHA512-CRYPT}${hash}`;
++      });
++      if (!found) throw notFound();
++      await writeAtomic(path, fromLines(next));
++    });
++  }
++
++  /** Menghapus akun dan kuotanya. Isi mailbox di disk tidak disentuh. */
++  async remove(email: string): Promise<void> {
++    await this.#serial(async () => {
++      const accountsPath = this.#path(ACCOUNTS_FILE);
++      const lines = toLines(await readText(accountsPath));
++      const kept = lines.filter((l) => accountOf(l) !== email);
++      if (kept.length === lines.length) throw notFound();
++      await writeAtomic(accountsPath, fromLines(kept));
++
++      const quotasPath = this.#path(QUOTAS_FILE);
++      const quotaLines = toLines(await readText(quotasPath));
++      const quotaKept = quotaLines.filter((l) => quotaOf(l) !== email);
++      if (quotaKept.length !== quotaLines.length) {
++        await writeAtomic(quotasPath, fromLines(quotaKept));
++      }
++    });
++  }
++
++  /** Mengatur kuota (mis. "2G"), atau menghapusnya bila null. */
++  async setQuota(email: string, quota: string | null): Promise<void> {
++    await this.#serial(async () => {
++      const accounts = toLines(await readText(this.#path(ACCOUNTS_FILE)));
++      if (!accounts.some((l) => accountOf(l) === email)) throw notFound();
++
++      const quotasPath = this.#path(QUOTAS_FILE);
++      const lines = toLines(await readText(quotasPath));
++      const rest = lines.filter((l) => quotaOf(l) !== email);
++      if (quota !== null) rest.push(`${email}:${quota}`);
++      await writeAtomic(quotasPath, fromLines(rest));
++    });
++  }
++}
+diff --git a/agent/src/validate.ts b/agent/src/validate.ts
+new file mode 100644
+index 0000000..5ab7e03
+--- /dev/null
++++ b/agent/src/validate.ts
+@@ -0,0 +1,41 @@
++const LOCAL_PART = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
++const QUOTA = /^[1-9]\d{0,5}[MG]$/;
++
++export const PASSWORD_MIN = 12;
++export const PASSWORD_MAX = 128;
++
++/** Email huruf kecil bila valid dan berada di domain yang diizinkan, selain itu null. */
++export function normalizeEmail(raw: unknown, domain: string): string | null {
++  if (typeof raw !== "string") return null;
++  const value = raw.trim().toLowerCase();
++  if (value.length > 254) return null;
++  const parts = value.split("@");
++  if (parts.length !== 2) return null;
++  const [local, host] = parts as [string, string];
++  if (host !== domain) return null;
++  if (!LOCAL_PART.test(local) || local.includes("..")) return null;
++  return `${local}@${host}`;
++}
++
++/** Pesan masalah bila password tidak memenuhi syarat, atau null bila boleh. */
++export function passwordProblem(raw: unknown): string | null {
++  if (typeof raw !== "string") return "password harus berupa teks";
++  if (raw.length < PASSWORD_MIN)
++    return `password minimal ${PASSWORD_MIN} karakter`;
++  if (raw.length > PASSWORD_MAX)
++    return `password maksimal ${PASSWORD_MAX} karakter`;
++  if (/[\r\n\0]/.test(raw)) {
++    return "password tidak boleh berisi baris baru atau karakter kosong";
++  }
++  return null;
++}
++
++export type QuotaInput = { ok: true; value: string | null } | { ok: false };
++
++/** null menghapus kuota; selain itu bentuk seperti 500M atau 2G. */
++export function parseQuota(raw: unknown): QuotaInput {
++  if (raw === null) return { ok: true, value: null };
++  if (typeof raw !== "string") return { ok: false };
++  const value = raw.trim().toUpperCase();
++  return QUOTA.test(value) ? { ok: true, value } : { ok: false };
++}
+diff --git a/agent/test/server.check.ts b/agent/test/server.check.ts
+new file mode 100644
+index 0000000..82db1ef
+--- /dev/null
++++ b/agent/test/server.check.ts
+@@ -0,0 +1,205 @@
++import assert from "node:assert/strict";
++import type { AddressInfo } from "node:net";
++import { mkdtemp, rm } from "node:fs/promises";
++import type { Server } from "node:http";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { after, before, test } from "node:test";
++import { createAgentApp } from "../src/app.ts";
++import { AccountStore } from "../src/store.ts";
++
++const TOKEN = "ab".repeat(32);
++let dir: string;
++let server: Server;
++let base: string;
++
++before(async () => {
++  dir = await mkdtemp(join(tmpdir(), "agent-http-"));
++  server = createAgentApp(
++    {
++      token: TOKEN,
++      domain: "example.com",
++      configDir: dir,
++      port: 0,
++      host: "127.0.0.1",
++    },
++    new AccountStore(dir),
++  );
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
++});
++after(async () => {
++  await new Promise<void>((resolve) => server.close(() => resolve()));
++  await rm(dir, { recursive: true, force: true });
++});
++
++const auth = { Authorization: `Bearer ${TOKEN}` };
++const json = { ...auth, "Content-Type": "application/json" };
++
++async function call(
++  method: string,
++  path: string,
++  body?: unknown,
++  headers: Record<string, string> = json,
++) {
++  const res = await fetch(`${base}${path}`, {
++    method,
++    headers,
++    body: body === undefined ? undefined : JSON.stringify(body),
++  });
++  return {
++    status: res.status,
++    body: (await res.json()) as Record<string, any>,
++  };
++}
++
++test("/health terbuka tanpa token, rute lain menolak tanpa atau dengan token salah", async () => {
++  assert.equal((await call("GET", "/health", undefined, {})).status, 200);
++  assert.equal((await call("GET", "/accounts", undefined, {})).status, 401);
++  assert.equal(
++    (
++      await call("GET", "/accounts", undefined, {
++        Authorization: "Bearer salah",
++      })
++    ).status,
++    401,
++  );
++  assert.equal(
++    (await call("GET", "/accounts", undefined, { Authorization: TOKEN }))
++      .status,
++    401,
++  );
++  const wrong = { Authorization: `Bearer ${"cd".repeat(32)}` };
++  assert.equal((await call("GET", "/accounts", undefined, wrong)).status, 401);
++});
++
++test("alur akun lengkap lewat HTTP", async () => {
++  const created = await call("POST", "/accounts", {
++    email: "Siti@Example.com",
++    password: "Sandi Siti 123456",
++  });
++  assert.equal(created.status, 201);
++  assert.deepEqual(created.body, { email: "siti@example.com" });
++
++  const dup = await call("POST", "/accounts", {
++    email: "siti@example.com",
++    password: "Sandi Siti 123456",
++  });
++  assert.equal(dup.status, 409);
++  assert.equal(dup.body.error.code, "ACCOUNT_EXISTS");
++
++  const list = await call("GET", "/accounts");
++  assert.equal(list.status, 200);
++  assert.deepEqual(list.body.accounts, [
++    { email: "siti@example.com", quota: null },
++  ]);
++  assert.equal(JSON.stringify(list.body).includes("$6$"), false);
++
++  assert.equal(
++    (
++      await call("PUT", "/accounts/siti%40example.com/password", {
++        password: "Sandi Baru Siti 789",
++      })
++    ).status,
++    200,
++  );
++  const q = await call("PUT", "/accounts/siti%40example.com/quota", {
++    quota: "2g",
++  });
++  assert.deepEqual(q.body, { email: "siti@example.com", quota: "2G" });
++  assert.equal((await call("GET", "/accounts")).body.accounts[0].quota, "2G");
++  assert.equal(
++    (await call("PUT", "/accounts/siti%40example.com/quota", { quota: null }))
++      .body.quota,
++    null,
++  );
++
++  assert.equal(
++    (await call("DELETE", "/accounts/siti%40example.com")).status,
++    200,
++  );
++  assert.equal(
++    (await call("DELETE", "/accounts/siti%40example.com")).status,
++    404,
++  );
++  assert.deepEqual((await call("GET", "/accounts")).body.accounts, []);
++});
++
++test("input tidak valid ditolak dengan 400 dan pesan yang jelas", async () => {
++  const cases: Array<[string, string, unknown, string]> = [
++    [
++      "POST",
++      "/accounts",
++      { email: "x@lain.com", password: "Sandi Cukup Panjang" },
++      "INVALID_EMAIL",
++    ],
++    [
++      "POST",
++      "/accounts",
++      { email: "x@example.com", password: "pendek" },
++      "INVALID_PASSWORD",
++    ],
++    ["POST", "/accounts", { password: "Sandi Cukup Panjang" }, "INVALID_EMAIL"],
++    [
++      "PUT",
++      "/accounts/siti%40example.com/quota",
++      { quota: "99X" },
++      "INVALID_QUOTA",
++    ],
++    [
++      "PUT",
++      "/accounts/%E0%A4%A/password",
++      { password: "Sandi Cukup Panjang" },
++      "INVALID_EMAIL",
++    ],
++    [
++      "PUT",
++      "/accounts/..%2F..%2Fetc%2Fpasswd/password",
++      { password: "Sandi Cukup Panjang" },
++      "INVALID_EMAIL",
++    ],
++  ];
++  for (const [method, path, body, code] of cases) {
++    const res = await call(method, path, body);
++    assert.equal(res.status, 400, `${method} ${path}`);
++    assert.equal(res.body.error.code, code, `${method} ${path}`);
++  }
++});
++
++test("body terlalu besar 413, bukan JSON 415, JSON rusak 400", async () => {
++  const big = await call("POST", "/accounts", {
++    email: "a@example.com",
++    password: "x".repeat(20_000),
++  });
++  assert.equal(big.status, 413);
++  assert.equal(
++    (
++      await call(
++        "POST",
++        "/accounts",
++        { x: 1 },
++        { ...auth, "Content-Type": "text/plain" },
++      )
++    ).status,
++    415,
++  );
++  const broken = await fetch(`${base}/accounts`, {
++    method: "POST",
++    headers: json,
++    body: "{rusak",
++  });
++  assert.equal(broken.status, 400);
++});
++
++test("rute tidak dikenal 404 dan metode salah 405", async () => {
++  assert.equal((await call("GET", "/tidak-ada")).status, 404);
++  assert.equal((await call("DELETE", "/accounts")).status, 405);
++  assert.equal(
++    (await call("GET", "/accounts/siti%40example.com/password")).status,
++    405,
++  );
++  assert.equal(
++    (await call("POST", "/accounts/siti%40example.com", {})).status,
++    405,
++  );
++});
+diff --git a/agent/test/store.check.ts b/agent/test/store.check.ts
+new file mode 100644
+index 0000000..6ef87c8
+--- /dev/null
++++ b/agent/test/store.check.ts
+@@ -0,0 +1,200 @@
++import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { after, before, test } from "node:test";
++import { AccountStore, StoreError } from "../src/store.ts";
++
++let dir: string;
++let store: AccountStore;
++
++before(async () => {
++  dir = await mkdtemp(join(tmpdir(), "agent-store-"));
++  store = new AccountStore(dir);
++});
++after(async () => {
++  await rm(dir, { recursive: true, force: true });
++});
++
++const accountsFile = () => join(dir, "postfix-accounts.cf");
++const read = (name: string) => readFile(join(dir, name), "utf8");
++
++/** Menghitung ulang hash dengan salt yang sama lewat openssl dan membandingkannya. */
++function passwordMatches(line: string, password: string): boolean {
++  const hash = line.split("|{SHA512-CRYPT}")[1] ?? "";
++  const salt = hash.split("$")[2] ?? "";
++  const again = execFileSync(
++    "openssl",
++    ["passwd", "-6", "-salt", salt, "-stdin"],
++    {
++      input: `${password}\n`,
++    },
++  )
++    .toString()
++    .trim();
++  return again === hash;
++}
++
++const lineOf = async (email: string) =>
++  (await read("postfix-accounts.cf"))
++    .split("\n")
++    .find((l) => l.startsWith(`${email}|`)) ?? "";
++
++test("create menulis baris SHA512-CRYPT yang cocok dengan password", async () => {
++  await store.create("budi@example.com", "Sandi Pertama 123!");
++  const line = await lineOf("budi@example.com");
++  assert.match(
++    line,
++    /^budi@example\.com\|\{SHA512-CRYPT\}\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$/,
++  );
++  assert.equal(passwordMatches(line, "Sandi Pertama 123!"), true);
++  assert.equal(passwordMatches(line, "sandi salah 12345"), false);
++  assert.ok((await read("postfix-accounts.cf")).endsWith("\n"));
++});
++
++test("password dengan spasi, simbol, dan unicode tersimpan apa adanya", async () => {
++  const passwords = [
++    "  spasi di tepi  ",
++    "p@ss:word/dengan|simbol$&'\"`",
++    "kata sandi ✓ ünïcode 日本語",
++  ];
++  for (const [i, password] of passwords.entries()) {
++    const email = `unik${i}@example.com`;
++    await store.create(email, password);
++    assert.equal(passwordMatches(await lineOf(email), password), true, email);
++  }
++});
++
++test("create menolak akun ganda dengan 409", async () => {
++  await assert.rejects(
++    store.create("budi@example.com", "Sandi Kedua 12345"),
++    (e: unknown) =>
++      e instanceof StoreError &&
++      e.status === 409 &&
++      e.code === "ACCOUNT_EXISTS",
++  );
++});
++
++test("setPassword mengganti hash akun itu saja", async () => {
++  const before = await lineOf("unik0@example.com");
++  await store.setPassword("budi@example.com", "Sandi Baru 456789!");
++  const line = await lineOf("budi@example.com");
++  assert.equal(passwordMatches(line, "Sandi Baru 456789!"), true);
++  assert.equal(passwordMatches(line, "Sandi Pertama 123!"), false);
++  assert.equal(await lineOf("unik0@example.com"), before);
++});
++
++test("setPassword, setQuota, dan remove pada akun yang tidak ada memberi 404", async () => {
++  const notFound = (e: unknown) => e instanceof StoreError && e.status === 404;
++  await assert.rejects(
++    store.setPassword("hantu@example.com", "Sandi Apa Saja 1"),
++    notFound,
++  );
++  await assert.rejects(store.setQuota("hantu@example.com", "1G"), notFound);
++  await assert.rejects(store.remove("hantu@example.com"), notFound);
++});
++
++test("kuota: atur, tampil di list, ubah, dan hapus", async () => {
++  await store.setQuota("budi@example.com", "2G");
++  assert.equal(
++    (await store.list()).find((a) => a.email === "budi@example.com")?.quota,
++    "2G",
++  );
++  await store.setQuota("budi@example.com", "500M");
++  assert.equal(
++    (await read("dovecot-quotas.cf")).match(/budi@example\.com:/g)?.length,
++    1,
++  );
++  assert.equal(
++    (await store.list()).find((a) => a.email === "budi@example.com")?.quota,
++    "500M",
++  );
++  await store.setQuota("budi@example.com", null);
++  assert.equal(
++    (await store.list()).find((a) => a.email === "budi@example.com")?.quota,
++    null,
++  );
++});
++
++test("list tidak pernah memuat hash dan terurut", async () => {
++  const accounts = await store.list();
++  assert.ok(accounts.length >= 4);
++  assert.ok(JSON.stringify(accounts).indexOf("$6$") === -1);
++  const emails = accounts.map((a) => a.email);
++  assert.deepEqual(
++    emails,
++    [...emails].sort((a, b) => a.localeCompare(b)),
++  );
++});
++
++test("remove menghapus akun beserta kuotanya dan membiarkan akun lain", async () => {
++  await store.setQuota("unik1@example.com", "1G");
++  await store.remove("unik1@example.com");
++  assert.equal(
++    (await read("postfix-accounts.cf")).includes("unik1@example.com"),
++    false,
++  );
++  assert.equal(
++    (await read("dovecot-quotas.cf")).includes("unik1@example.com"),
++    false,
++  );
++  assert.ok((await read("postfix-accounts.cf")).includes("unik0@example.com"));
++});
++
++test("komentar dan baris asing dipertahankan, CRLF dirapikan", async () => {
++  const other = await mkdtemp(join(tmpdir(), "agent-keep-"));
++  try {
++    await writeFile(
++      join(other, "postfix-accounts.cf"),
++      "# akun lama\r\nlama@example.com|{SHA512-CRYPT}$6$abc$xyz\r\n\r\n# catatan\r\n",
++    );
++    await writeFile(
++      join(other, "dovecot-quotas.cf"),
++      "# kuota\nlama@example.com:3G\n",
++    );
++    const s = new AccountStore(other);
++    await s.create("baru@example.com", "Sandi Baru Banget 1");
++    await s.setQuota("baru@example.com", "1G");
++    const accounts = await readFile(join(other, "postfix-accounts.cf"), "utf8");
++    assert.ok(
++      accounts.startsWith(
++        "# akun lama\nlama@example.com|{SHA512-CRYPT}$6$abc$xyz\n",
++      ),
++    );
++    assert.ok(accounts.includes("# catatan"));
++    assert.ok(accounts.includes("baru@example.com|{SHA512-CRYPT}$6$"));
++    assert.equal(accounts.includes("\r"), false);
++    const quotas = await readFile(join(other, "dovecot-quotas.cf"), "utf8");
++    assert.ok(quotas.startsWith("# kuota\nlama@example.com:3G\n"));
++    assert.ok(quotas.includes("baru@example.com:1G"));
++  } finally {
++    await rm(other, { recursive: true, force: true });
++  }
++});
++
++test("15 pembuatan paralel semuanya tersimpan tanpa saling menimpa", async () => {
++  const other = await mkdtemp(join(tmpdir(), "agent-par-"));
++  try {
++    const s = new AccountStore(other);
++    await Promise.all(
++      Array.from({ length: 15 }, (_, i) =>
++        s.create(`par${i}@example.com`, `Sandi Paralel ${i} aman`),
++      ),
++    );
++    assert.equal((await s.list()).length, 15);
++  } finally {
++    await rm(other, { recursive: true, force: true });
++  }
++});
++
++test("salinan .bak dibuat dan tidak ada berkas .tmp tersisa", async () => {
++  const files = await readdir(dir);
++  assert.ok(files.includes("postfix-accounts.cf.bak"));
++  assert.deepEqual(
++    files.filter((f) => f.endsWith(".tmp")),
++    [],
++  );
++  assert.ok((await read("postfix-accounts.cf.bak")).length > 0);
++  assert.equal(accountsFile().endsWith("postfix-accounts.cf"), true);
++});
+diff --git a/agent/test/validate.check.ts b/agent/test/validate.check.ts
+new file mode 100644
+index 0000000..cbe01bd
+--- /dev/null
++++ b/agent/test/validate.check.ts
+@@ -0,0 +1,97 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { loadConfig } from "../src/config.ts";
++import {
++  normalizeEmail,
++  parseQuota,
++  passwordProblem,
++} from "../src/validate.ts";
++
++const DOMAIN = "example.com";
++
++test("normalizeEmail menerima email valid dan menyeragamkan huruf kecil", () => {
++  assert.equal(
++    normalizeEmail("Budi.Santoso@Example.com ", DOMAIN),
++    "budi.santoso@example.com",
++  );
++  assert.equal(normalizeEmail("a@example.com", DOMAIN), "a@example.com");
++  assert.equal(
++    normalizeEmail("tim-1_x@example.com", DOMAIN),
++    "tim-1_x@example.com",
++  );
++});
++
++test("normalizeEmail menolak domain lain, bentuk aneh, dan non-teks", () => {
++  for (const bad of [
++    "budi@lain.com",
++    "budi@sub.example.com",
++    "@example.com",
++    "budi@",
++    "budi",
++    "a@b@example.com",
++    "bu di@example.com",
++    "budi+tag@example.com",
++    ".budi@example.com",
++    "budi.@example.com",
++    "bu..di@example.com",
++    "budi\n@example.com",
++    "budi|x@example.com",
++    "budi:x@example.com",
++    `${"a".repeat(65)}@example.com`,
++  ]) {
++    assert.equal(normalizeEmail(bad, DOMAIN), null, bad);
++  }
++  assert.equal(normalizeEmail(123, DOMAIN), null);
++  assert.equal(normalizeEmail(undefined, DOMAIN), null);
++});
++
++test("passwordProblem memeriksa panjang dan karakter terlarang", () => {
++  assert.equal(passwordProblem("p@ss: dengan spasi ✓ ok"), null);
++  assert.equal(passwordProblem("a".repeat(12)), null);
++  assert.match(passwordProblem("pendek") ?? "", /minimal 12/);
++  assert.match(passwordProblem("a".repeat(129)) ?? "", /maksimal 128/);
++  assert.match(passwordProblem(`${"a".repeat(12)}\nx`) ?? "", /baris baru/);
++  assert.match(passwordProblem(`${"a".repeat(12)}\0`) ?? "", /baris baru/);
++  assert.match(passwordProblem(42) ?? "", /teks/);
++});
++
++test("parseQuota menerima 500M dan 2G, null untuk hapus, dan menolak sisanya", () => {
++  assert.deepEqual(parseQuota("2g"), { ok: true, value: "2G" });
++  assert.deepEqual(parseQuota(" 500M "), { ok: true, value: "500M" });
++  assert.deepEqual(parseQuota(null), { ok: true, value: null });
++  for (const bad of [
++    "0G",
++    "2",
++    "2T",
++    "G",
++    "-1G",
++    "1.5G",
++    "2GB",
++    "",
++    5,
++    undefined,
++  ]) {
++    assert.deepEqual(parseQuota(bad), { ok: false }, String(bad));
++  }
++});
++
++test("loadConfig menolak token dan domain tidak valid tanpa menampilkan nilainya", () => {
++  assert.throws(
++    () =>
++      loadConfig({
++        AGENT_TOKEN: "rahasia-pendek",
++        MAIL_DOMAIN: "bukan domain",
++      }),
++    (err: Error) =>
++      /AGENT_TOKEN/.test(err.message) &&
++      /MAIL_DOMAIN/.test(err.message) &&
++      !err.message.includes("rahasia-pendek"),
++  );
++  const ok = loadConfig({
++    AGENT_TOKEN: "a".repeat(64),
++    MAIL_DOMAIN: "Example.COM",
++  });
++  assert.equal(ok.domain, "example.com");
++  assert.equal(ok.port, 4000);
++  assert.equal(ok.configDir, "/config");
++});
+diff --git a/agent/tsconfig.json b/agent/tsconfig.json
+new file mode 100644
+index 0000000..f32ad82
+--- /dev/null
++++ b/agent/tsconfig.json
+@@ -0,0 +1,17 @@
++{
++  "compilerOptions": {
++    "target": "es2023",
++    "lib": ["es2023"],
++    "module": "nodenext",
++    "types": ["node"],
++    "strict": true,
++    "noUncheckedIndexedAccess": true,
++    "allowImportingTsExtensions": true,
++    "erasableSyntaxOnly": true,
++    "verbatimModuleSyntax": true,
++    "noEmit": true,
++    "skipLibCheck": true,
++    "moduleDetection": "force"
++  },
++  "include": ["src", "test"]
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a277e17..6c2176d 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -19,6 +19,27 @@ services:
+     security_opt:
+       - no-new-privileges:true
+ 
++  account-agent:
++    build:
++      context: ./agent
++    image: mailweb-account-agent:1
++    container_name: mailweb-account-agent
++    restart: always
++    env_file:
++      - .env.agent
++    networks:
++      - mailweb-net
++    volumes:
++      - /share/Container/mailserver/config:/config
++    user: "0:0"
++    read_only: true
++    tmpfs:
++      - /tmp
++    cap_drop:
++      - ALL
++    security_opt:
++      - no-new-privileges:true
++
+ networks:
+   mailweb-net:
+     external: true

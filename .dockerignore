@@ -1,11 +1,6 @@
 node_modules
-dist
-generated
-tests
-.git
+test
 .env
 .env.*
-!.env.example
-*.log
 Dockerfile
-docker-compose.yml
+tsconfig.json
