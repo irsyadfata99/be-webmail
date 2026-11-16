@@ -100,6 +100,9 @@ const schema = z
       .transform((v) => (v && v.trim().length > 0 ? v.trim() : undefined))
       .pipe(hex64.optional()),
 
+    // Akun ADMIN wajib mengaktifkan 2FA sebelum boleh memakai /api/admin.
+    ADMIN_REQUIRE_2FA: z.stringbool().default(true),
+
     ADMIN_EMAILS: z
       .string()
       .default("")

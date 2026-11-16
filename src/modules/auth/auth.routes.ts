@@ -5,6 +5,7 @@ import { clearAuthCookies, setAuthCookies } from "../../lib/cookies.js";
 import { authenticate } from "../../middleware/auth.js";
 import { AppError } from "../../middleware/error-handler.js";
 import { loginSchema } from "./auth.schema.js";
+import { twoFactorRouter } from "./twofactor.routes.js";
 import { login, logout } from "./auth.service.js";
 
 const loginLimiter = rateLimit({
@@ -24,6 +25,8 @@ const loginLimiter = rateLimit({
 });
 
 export const authRouter = Router();
+
+authRouter.use("/2fa", twoFactorRouter);
 
 authRouter.post("/login", loginLimiter, async (req, res) => {
   const { email, password } = loginSchema.parse(req.body);

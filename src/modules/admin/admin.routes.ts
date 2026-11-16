@@ -21,6 +21,7 @@ import {
   resetPassword,
   setQuota,
 } from "./admin.service.js";
+import { resetTwoFactorByAdmin } from "../auth/twofactor.service.js";
 import { getAgent } from "./agent.client.js";
 
 const adminLimiter = rateLimit({
@@ -96,4 +97,9 @@ adminRouter.patch("/accounts/:email", async (req, res) => {
 adminRouter.delete("/accounts/:email", async (req, res) => {
   const { email } = accountParams.parse(req.params);
   res.json(await deleteAccount(req, authOf(req), getAgent(), email));
+});
+
+adminRouter.delete("/accounts/:email/2fa", async (req, res) => {
+  const { email } = accountParams.parse(req.params);
+  res.json(await resetTwoFactorByAdmin(req, authOf(req), email));
 });

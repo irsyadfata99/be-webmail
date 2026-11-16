@@ -136,12 +136,47 @@ test("setActive(false) mengunci login, setActive(true) mengembalikan hash asli",
   await store.setActive(email, false);
   await store.setActive(email, true);
   assert.equal(await lineOf(email), original);
-  assert.equal(passwordMatches(await lineOf(email), "Sandi Asli Kunci 1!"), true);
+  assert.equal(
+    passwordMatches(await lineOf(email), "Sandi Asli Kunci 1!"),
+    true,
+  );
   assert.equal(
     (await store.list()).find((a) => a.email === email)?.disabled,
     false,
   );
   assert.equal((await read("webmail-disabled.cf")).includes(email), false);
+});
+
+test("setActive(false) melanjutkan penguncian yang terhenti di tengah, tanpa menimpa hash asli", async () => {
+  const email = "setengah@example.com";
+  await store.create(email, "Sandi Setengah Jalan 1!");
+  const original = await lineOf(email);
+
+  // Meniru kegagalan: hash asli sudah tersimpan, tetapi baris akun belum dikunci.
+  const saved = await readFile(join(dir, "webmail-disabled.cf"), "utf8").catch(
+    () => "",
+  );
+  await writeFile(
+    join(dir, "webmail-disabled.cf"),
+    `${saved}${email}|${original.split("|")[1]}\n`,
+  );
+  assert.equal(await lineOf(email), original);
+
+  await store.setActive(email, false);
+  const locked = await lineOf(email);
+  assert.notEqual(locked, original);
+  assert.equal(passwordMatches(locked, "Sandi Setengah Jalan 1!"), false);
+  const entries = (await read("webmail-disabled.cf"))
+    .split("\n")
+    .filter((l) => l.startsWith(`${email}|`));
+  assert.equal(entries.length, 1);
+
+  await store.setActive(email, true);
+  assert.equal(await lineOf(email), original);
+  assert.equal(
+    passwordMatches(await lineOf(email), "Sandi Setengah Jalan 1!"),
+    true,
+  );
 });
 
 test("password direset saat akun nonaktif: tetap terkunci, berlaku setelah diaktifkan", async () => {
@@ -152,8 +187,14 @@ test("password direset saat akun nonaktif: tetap terkunci, berlaku setelah diakt
   await store.setPassword(email, "Sandi Baru Reset 2!");
   assert.equal(await lineOf(email), locked);
   await store.setActive(email, true);
-  assert.equal(passwordMatches(await lineOf(email), "Sandi Baru Reset 2!"), true);
-  assert.equal(passwordMatches(await lineOf(email), "Sandi Lama Reset 1!"), false);
+  assert.equal(
+    passwordMatches(await lineOf(email), "Sandi Baru Reset 2!"),
+    true,
+  );
+  assert.equal(
+    passwordMatches(await lineOf(email), "Sandi Lama Reset 1!"),
+    false,
+  );
 });
 
 test("setActive pada akun tak ada memberi 404; remove membersihkan catatan nonaktif", async () => {

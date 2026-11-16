@@ -32,12 +32,27 @@ describe("auditLogsQuery", () => {
     expect(q.pageSize).toBe(20);
   });
 
-  it("to berupa tanggal saja mencakup seluruh hari itu (batas atas eksklusif)", () => {
+  it("tanggal tanpa jam memakai hari WIB; to mencakup seluruh hari itu (batas atas eksklusif)", () => {
     const q = auditLogsQuery.parse({ from: "2026-11-01", to: "2026-11-16" });
     const where = auditWhere(q);
     expect(where.createdAt).toEqual({
-      gte: new Date("2026-11-01T00:00:00.000Z"),
-      lt: new Date("2026-11-17T00:00:00.000Z"),
+      gte: new Date("2026-10-31T17:00:00.000Z"),
+      lt: new Date("2026-11-16T17:00:00.000Z"),
+    });
+  });
+
+  it("satu hari WIB: from dan to sama mencakup 00.00 sampai 24.00 WIB", () => {
+    const q = auditLogsQuery.parse({ from: "2026-11-16", to: "2026-11-16" });
+    expect(auditWhere(q).createdAt).toEqual({
+      gte: new Date("2026-11-15T17:00:00.000Z"),
+      lt: new Date("2026-11-16T17:00:00.000Z"),
+    });
+  });
+
+  it("from berupa waktu lengkap dipakai apa adanya", () => {
+    const q = auditLogsQuery.parse({ from: "2026-11-16T05:00:00Z" });
+    expect(auditWhere(q).createdAt).toEqual({
+      gte: new Date("2026-11-16T05:00:00Z"),
     });
   });
 

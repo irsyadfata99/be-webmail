@@ -1,4 +1,5 @@
 import type { Request, RequestHandler } from "express";
+import { env } from "../config/env.js";
 import { getSessionToken } from "../lib/cookies.js";
 import { hashToken } from "../lib/crypto.js";
 import { prisma } from "../lib/prisma.js";
@@ -65,9 +66,18 @@ export const requireAuth: RequestHandler = async (req, _res, next) => {
   next();
 };
 
+/** Admin, dan (bila ADMIN_REQUIRE_2FA) sudah mengaktifkan 2FA; requireAuth memastikan 2FA-nya terverifikasi. */
 export const requireAdmin: RequestHandler = (req, _res, next) => {
-  if (req.auth?.user.role !== "ADMIN") {
+  const user = req.auth?.user;
+  if (user?.role !== "ADMIN") {
     throw new AppError(403, "FORBIDDEN", "Akses ditolak");
+  }
+  if (env.ADMIN_REQUIRE_2FA && !user.twoFactorEnabled) {
+    throw new AppError(
+      403,
+      "TWO_FACTOR_SETUP_REQUIRED",
+      "Aktifkan 2FA terlebih dahulu untuk memakai fitur admin",
+    );
   }
   next();
 };

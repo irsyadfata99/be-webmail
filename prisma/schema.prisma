@@ -20,13 +20,16 @@ model User {
   role             Role      @default(USER)
   isActive         Boolean   @default(true)
   totpSecretEnc    String?
+  // Langkah TOTP terakhir yang diterima; mencegah kode yang sama dipakai dua kali.
+  totpLastStep     Int?
   twoFactorEnabled Boolean   @default(false)
   lastLoginAt      DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
-  sessions  Session[]
-  auditLogs AuditLog[]
+  sessions      Session[]
+  auditLogs     AuditLog[]
+  recoveryCodes RecoveryCode[]
 
   @@map("users")
 }
@@ -78,4 +81,17 @@ model AuditLog {
   @@index([action, createdAt])
   @@index([targetEmail])
   @@map("audit_logs")
+}
+
+/// Kode pemulihan 2FA: hanya hash (HMAC) yang disimpan, sekali pakai.
+model RecoveryCode {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("recovery_codes")
 }

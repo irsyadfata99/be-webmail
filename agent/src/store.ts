@@ -253,12 +253,17 @@ export class AccountStore {
       const saved = disabledLines.find((l) => accountOf(l) === email);
 
       if (!active) {
-        if (saved) return;
+        // Catatan ada dan hash akun sudah berbeda darinya: akun memang sudah terkunci.
+        // Bila hash akun masih sama dengan catatan, percobaan mengunci sebelumnya terhenti
+        // di tengah (langkah kedua gagal), jadi kunci tetap dipasang.
+        if (saved && hashOf(saved) !== hashOf(current)) return;
         // Hash asli ditulis lebih dulu agar tidak pernah hilang bila langkah kedua gagal.
-        await writeAtomic(
-          disabledPath,
-          fromLines([...disabledLines, `${email}|${hashOf(current)}`]),
-        );
+        if (!saved) {
+          await writeAtomic(
+            disabledPath,
+            fromLines([...disabledLines, `${email}|${hashOf(current)}`]),
+          );
+        }
         await writeAtomic(
           accountsPath,
           fromLines(

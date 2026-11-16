@@ -78,11 +78,22 @@ const queryDate = z
   .trim()
   .refine((v) => !Number.isNaN(Date.parse(v)), "tanggal tidak valid");
 
-/** Filter log audit; semua opsional. `to` berupa tanggal saja mencakup seluruh hari itu. */
+/** Tanggal tanpa jam dibaca sebagai waktu Jakarta (WIB, UTC+7), bukan UTC. */
+const WIB_OFFSET = "+07:00";
+const DAY_MS = 86_400_000;
+const startOfDayWib = (day: string): Date =>
+  new Date(`${day}T00:00:00${WIB_OFFSET}`);
+
+/** Filter log audit; semua opsional. Tanggal tanpa jam memakai hari WIB; `to` seperti itu mencakup seluruh harinya. */
 export const auditLogsQuery = z
   .object({
     page: z.coerce.number().int().min(1).max(10_000).default(1),
-    pageSize: z.coerce.number().int().min(1).max(100).default(DEFAULT_PAGE_SIZE),
+    pageSize: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .default(DEFAULT_PAGE_SIZE),
     actor: accountEmail.optional(),
     target: accountEmail.optional(),
     action: z
@@ -94,14 +105,19 @@ export const auditLogsQuery = z
     to: queryDate.optional(),
   })
   .transform((q, ctx) => {
-    const from = q.from ? new Date(q.from) : undefined;
+    const from = q.from
+      ? dateOnly.test(q.from)
+        ? startOfDayWib(q.from)
+        : new Date(q.from)
+      : undefined;
     let to: Date | undefined;
     let toInclusive = true;
     if (q.to) {
-      to = new Date(q.to);
       if (dateOnly.test(q.to)) {
-        to.setUTCDate(to.getUTCDate() + 1);
+        to = new Date(startOfDayWib(q.to).getTime() + DAY_MS);
         toInclusive = false;
+      } else {
+        to = new Date(q.to);
       }
     }
     if (from && to && from >= to) {

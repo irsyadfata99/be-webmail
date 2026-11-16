@@ -301,6 +301,37 @@ describe("toAccountView", () => {
     });
   });
 
+  it("akun yang terkunci di mailserver tampil nonaktif walau database mencatat aktif", () => {
+    const user = {
+      displayName: "Budi",
+      role: "USER" as const,
+      isActive: true,
+      twoFactorEnabled: false,
+      lastLoginAt: null,
+    };
+    expect(
+      toAccountView(
+        { email: "budi@contoh.id", quota: null, disabled: true },
+        user,
+        admins,
+      ).isActive,
+    ).toBe(false);
+    expect(
+      toAccountView(
+        { email: "budi@contoh.id", quota: null, disabled: false },
+        user,
+        admins,
+      ).isActive,
+    ).toBe(true);
+    expect(
+      toAccountView(
+        { email: "baru@contoh.id", quota: null, disabled: true },
+        undefined,
+        admins,
+      ).isActive,
+    ).toBe(false);
+  });
+
   it("akun yang belum pernah login: nama dari bagian lokal, role dari ADMIN_EMAILS, belum terdaftar", () => {
     expect(
       toAccountView(
@@ -320,8 +351,7 @@ describe("toAccountView", () => {
         { email: "siti@contoh.id", quota: null, disabled: false },
         undefined,
         admins,
-      )
-        .role,
+      ).role,
     ).toBe("USER");
   });
 });

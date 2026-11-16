@@ -36,7 +36,8 @@ export function toAccountView(
     displayName: user?.displayName ?? localPart(account.email),
     role:
       user?.role ?? (adminEmails.includes(account.email) ? "ADMIN" : "USER"),
-    isActive: user?.isActive ?? true,
+    // Terkunci di mailserver berarti tidak aktif, walau database belum mencatatnya.
+    isActive: !account.disabled && (user?.isActive ?? true),
     twoFactorEnabled: user?.twoFactorEnabled ?? false,
     lastLoginAt: user?.lastLoginAt?.toISOString() ?? null,
     registered: user !== undefined,
