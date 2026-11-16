@@ -91,7 +91,7 @@ export async function createAccount(
 
   return {
     account: toAccountView(
-      { email: body.email, quota },
+      { email: body.email, quota, disabled: false },
       user,
       env.ADMIN_EMAILS,
     ),
@@ -145,6 +145,11 @@ export async function patchAccount(
   if (body.isActive === false) assertNotSelf(actor, email);
   const mailbox = await findAccount(agent, email);
 
+  // Kunci/buka login IMAP dan SMTP lebih dulu; bila gagal, database tidak diubah.
+  if (body.isActive !== undefined) {
+    await agent.setActive(email, body.isActive);
+  }
+
   const user = await prisma.user.upsert({
     where: { email },
     create: {
@@ -182,7 +187,14 @@ export async function patchAccount(
   }
 
   return {
-    account: toAccountView(mailbox, user, env.ADMIN_EMAILS),
+    account: toAccountView(
+      {
+        ...mailbox,
+        disabled: body.isActive !== undefined ? !body.isActive : mailbox.disabled,
+      },
+      user,
+      env.ADMIN_EMAILS,
+    ),
     sessionsRevoked,
   };
 }

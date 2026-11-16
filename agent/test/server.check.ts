@@ -91,9 +91,30 @@ test("alur akun lengkap lewat HTTP", async () => {
   const list = await call("GET", "/accounts");
   assert.equal(list.status, 200);
   assert.deepEqual(list.body.accounts, [
-    { email: "siti@example.com", quota: null },
+    { email: "siti@example.com", quota: null, disabled: false },
   ]);
   assert.equal(JSON.stringify(list.body).includes("$6$"), false);
+
+  const off = await call("PUT", "/accounts/siti%40example.com/active", {
+    active: false,
+  });
+  assert.deepEqual(off.body, { email: "siti@example.com", active: false });
+  assert.equal((await call("GET", "/accounts")).body.accounts[0].disabled, true);
+  assert.equal(
+    (await call("PUT", "/accounts/siti%40example.com/active", { active: "ya" }))
+      .status,
+    400,
+  );
+  assert.equal(
+    (await call("PUT", "/accounts/hantu%40example.com/active", { active: false }))
+      .status,
+    404,
+  );
+  await call("PUT", "/accounts/siti%40example.com/active", { active: true });
+  assert.equal(
+    (await call("GET", "/accounts")).body.accounts[0].disabled,
+    false,
+  );
 
   assert.equal(
     (

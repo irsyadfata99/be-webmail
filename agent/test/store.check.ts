@@ -117,6 +117,62 @@ test("kuota: atur, tampil di list, ubah, dan hapus", async () => {
   );
 });
 
+test("setActive(false) mengunci login, setActive(true) mengembalikan hash asli", async () => {
+  const email = "kunci@example.com";
+  await store.create(email, "Sandi Asli Kunci 1!");
+  const original = await lineOf(email);
+
+  await store.setActive(email, false);
+  const locked = await lineOf(email);
+  assert.notEqual(locked, original);
+  assert.equal(passwordMatches(locked, "Sandi Asli Kunci 1!"), false);
+  assert.match(locked, /^kunci@example\.com\|\{SHA512-CRYPT\}\$6\$/);
+  assert.equal(
+    (await store.list()).find((a) => a.email === email)?.disabled,
+    true,
+  );
+
+  // Idempoten: mengunci dua kali tidak menimpa hash asli yang tersimpan.
+  await store.setActive(email, false);
+  await store.setActive(email, true);
+  assert.equal(await lineOf(email), original);
+  assert.equal(passwordMatches(await lineOf(email), "Sandi Asli Kunci 1!"), true);
+  assert.equal(
+    (await store.list()).find((a) => a.email === email)?.disabled,
+    false,
+  );
+  assert.equal((await read("webmail-disabled.cf")).includes(email), false);
+});
+
+test("password direset saat akun nonaktif: tetap terkunci, berlaku setelah diaktifkan", async () => {
+  const email = "reset@example.com";
+  await store.create(email, "Sandi Lama Reset 1!");
+  await store.setActive(email, false);
+  const locked = await lineOf(email);
+  await store.setPassword(email, "Sandi Baru Reset 2!");
+  assert.equal(await lineOf(email), locked);
+  await store.setActive(email, true);
+  assert.equal(passwordMatches(await lineOf(email), "Sandi Baru Reset 2!"), true);
+  assert.equal(passwordMatches(await lineOf(email), "Sandi Lama Reset 1!"), false);
+});
+
+test("setActive pada akun tak ada memberi 404; remove membersihkan catatan nonaktif", async () => {
+  await assert.rejects(
+    store.setActive("hantu@example.com", false),
+    (e: unknown) => e instanceof StoreError && e.status === 404,
+  );
+  const email = "hapus@example.com";
+  await store.create(email, "Sandi Hapus Saya 1!");
+  await store.setActive(email, false);
+  await store.remove(email);
+  assert.equal((await read("webmail-disabled.cf")).includes(email), false);
+  await store.create(email, "Sandi Hapus Saya 1!");
+  assert.equal(
+    (await store.list()).find((a) => a.email === email)?.disabled,
+    false,
+  );
+});
+
 test("list tidak pernah memuat hash dan terurut", async () => {
   const accounts = await store.list();
   assert.ok(accounts.length >= 4);

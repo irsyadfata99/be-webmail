@@ -18,10 +18,14 @@ export class StoreError extends Error {
 export interface AccountInfo {
   email: string;
   quota: string | null;
+  /** true bila akun dikunci: login IMAP/SMTP ditolak, hash asli disimpan terpisah. */
+  disabled: boolean;
 }
 
 const ACCOUNTS_FILE = "postfix-accounts.cf";
 const QUOTAS_FILE = "dovecot-quotas.cf";
+/** Hash asli akun nonaktif, format `email|{SCHEME}hash`. Tidak dibaca docker-mailserver. */
+const DISABLED_FILE = "webmail-disabled.cf";
 
 function isNotFound(err: unknown): boolean {
   return (
@@ -56,6 +60,11 @@ function accountOf(line: string): string | null {
   const i = line.indexOf("|");
   if (i < 1) return null;
   return line.slice(0, i).trim().toLowerCase();
+}
+
+/** Bagian setelah `|` pada baris akun, yaitu `{SCHEME}hash`. */
+function hashOf(line: string): string {
+  return line.slice(line.indexOf("|") + 1).trim();
 }
 
 /** Email pada baris `email:kuota`; null untuk komentar atau baris asing. */
@@ -126,10 +135,17 @@ export class AccountStore {
   }
 
   async list(): Promise<AccountInfo[]> {
-    const [accounts, quotas] = await Promise.all([
+    const [accounts, quotas, disabledText] = await Promise.all([
       readText(this.#path(ACCOUNTS_FILE)),
       readText(this.#path(QUOTAS_FILE)),
+      readText(this.#path(DISABLED_FILE)),
     ]);
+
+    const disabled = new Set<string>();
+    for (const line of toLines(disabledText)) {
+      const email = accountOf(line);
+      if (email) disabled.add(email);
+    }
 
     const quotaByEmail = new Map<string, string>();
     for (const line of toLines(quotas)) {
@@ -140,7 +156,13 @@ export class AccountStore {
     const result: AccountInfo[] = [];
     for (const line of toLines(accounts)) {
       const email = accountOf(line);
-      if (email) result.push({ email, quota: quotaByEmail.get(email) ?? null });
+      if (email) {
+        result.push({
+          email,
+          quota: quotaByEmail.get(email) ?? null,
+          disabled: disabled.has(email),
+        });
+      }
     }
     return result.sort((a, b) => a.email.localeCompare(b.email));
   }
@@ -153,6 +175,7 @@ export class AccountStore {
       if (lines.some((l) => accountOf(l) === email)) {
         throw new StoreError(409, "ACCOUNT_EXISTS", "Akun sudah ada");
       }
+      await this.#dropDisabled(email);
       lines.push(`${email}|{SHA512-CRYPT}${hash}`);
       await writeAtomic(path, fromLines(lines));
     });
@@ -163,13 +186,22 @@ export class AccountStore {
     await this.#serial(async () => {
       const path = this.#path(ACCOUNTS_FILE);
       const lines = toLines(await readText(path));
-      let found = false;
-      const next = lines.map((line) => {
-        if (accountOf(line) !== email) return line;
-        found = true;
-        return `${email}|{SHA512-CRYPT}${hash}`;
-      });
-      if (!found) throw notFound();
+      if (!lines.some((l) => accountOf(l) === email)) throw notFound();
+
+      // Akun nonaktif tetap terkunci; password baru berlaku saat diaktifkan lagi.
+      const disabledPath = this.#path(DISABLED_FILE);
+      const disabledLines = toLines(await readText(disabledPath));
+      if (disabledLines.some((l) => accountOf(l) === email)) {
+        const updated = disabledLines.map((l) =>
+          accountOf(l) === email ? `${email}|{SHA512-CRYPT}${hash}` : l,
+        );
+        await writeAtomic(disabledPath, fromLines(updated));
+        return;
+      }
+
+      const next = lines.map((line) =>
+        accountOf(line) === email ? `${email}|{SHA512-CRYPT}${hash}` : line,
+      );
       await writeAtomic(path, fromLines(next));
     });
   }
@@ -182,6 +214,7 @@ export class AccountStore {
       const kept = lines.filter((l) => accountOf(l) !== email);
       if (kept.length === lines.length) throw notFound();
       await writeAtomic(accountsPath, fromLines(kept));
+      await this.#dropDisabled(email);
 
       const quotasPath = this.#path(QUOTAS_FILE);
       const quotaLines = toLines(await readText(quotasPath));
@@ -189,6 +222,67 @@ export class AccountStore {
       if (quotaKept.length !== quotaLines.length) {
         await writeAtomic(quotasPath, fromLines(quotaKept));
       }
+    });
+  }
+
+  /** Menghapus catatan hash asli akun nonaktif (bila ada). Dipanggil di dalam antrean. */
+  async #dropDisabled(email: string): Promise<void> {
+    const path = this.#path(DISABLED_FILE);
+    const lines = toLines(await readText(path));
+    const kept = lines.filter((l) => accountOf(l) !== email);
+    if (kept.length !== lines.length) await writeAtomic(path, fromLines(kept));
+  }
+
+  /**
+   * Mengunci atau membuka akun. Saat dikunci, hash asli disimpan di berkas
+   * terpisah dan baris akun diganti hash dari rahasia acak yang tak diketahui
+   * siapa pun, sehingga login IMAP dan SMTP gagal. Idempoten.
+   */
+  async setActive(email: string, active: boolean): Promise<void> {
+    const lockHash = active
+      ? ""
+      : await hashPassword(randomBytes(32).toString("hex"));
+    await this.#serial(async () => {
+      const accountsPath = this.#path(ACCOUNTS_FILE);
+      const accounts = toLines(await readText(accountsPath));
+      const current = accounts.find((l) => accountOf(l) === email);
+      if (!current) throw notFound();
+
+      const disabledPath = this.#path(DISABLED_FILE);
+      const disabledLines = toLines(await readText(disabledPath));
+      const saved = disabledLines.find((l) => accountOf(l) === email);
+
+      if (!active) {
+        if (saved) return;
+        // Hash asli ditulis lebih dulu agar tidak pernah hilang bila langkah kedua gagal.
+        await writeAtomic(
+          disabledPath,
+          fromLines([...disabledLines, `${email}|${hashOf(current)}`]),
+        );
+        await writeAtomic(
+          accountsPath,
+          fromLines(
+            accounts.map((l) =>
+              accountOf(l) === email ? `${email}|{SHA512-CRYPT}${lockHash}` : l,
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (!saved) return;
+      await writeAtomic(
+        accountsPath,
+        fromLines(
+          accounts.map((l) =>
+            accountOf(l) === email ? `${email}|${hashOf(saved)}` : l,
+          ),
+        ),
+      );
+      await writeAtomic(
+        disabledPath,
+        fromLines(disabledLines.filter((l) => accountOf(l) !== email)),
+      );
     });
   }
 

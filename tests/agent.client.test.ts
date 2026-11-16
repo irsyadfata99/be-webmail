@@ -179,7 +179,7 @@ describe("createAgentClient", () => {
     const fetchImpl = vi.fn(async () =>
       json(200, {
         accounts: [
-          { email: "a@contoh.id", quota: "2G" },
+          { email: "a@contoh.id", quota: "2G", disabled: true },
           { email: "b@contoh.id", quota: null },
           { quota: "1G" },
         ],
@@ -187,8 +187,8 @@ describe("createAgentClient", () => {
     );
     const accounts = await clientWith(fetchImpl as never).list();
     expect(accounts).toEqual([
-      { email: "a@contoh.id", quota: "2G" },
-      { email: "b@contoh.id", quota: null },
+      { email: "a@contoh.id", quota: "2G", disabled: true },
+      { email: "b@contoh.id", quota: null, disabled: false },
     ]);
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [
       string,
@@ -223,14 +223,17 @@ describe("createAgentClient", () => {
     const c = clientWith(fetchImpl as never);
     await c.setPassword("a@contoh.id", "rahasia-panjang");
     await c.setQuota("a@contoh.id", null);
+    await c.setActive("a@contoh.id", false);
     await c.remove("a@contoh.id");
     const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
     expect(calls.map(([u, i]) => `${i.method} ${u}`)).toEqual([
       "PUT http://account-agent:4000/accounts/a%40contoh.id/password",
       "PUT http://account-agent:4000/accounts/a%40contoh.id/quota",
+      "PUT http://account-agent:4000/accounts/a%40contoh.id/active",
       "DELETE http://account-agent:4000/accounts/a%40contoh.id",
     ]);
     expect(JSON.parse(calls[1]![1].body as string)).toEqual({ quota: null });
+    expect(JSON.parse(calls[2]![1].body as string)).toEqual({ active: false });
   });
 
   it("galat 4xx dari agent diteruskan dengan kode aslinya", async () => {
@@ -276,7 +279,7 @@ describe("toAccountView", () => {
 
   it("memakai data database bila ada", () => {
     const view = toAccountView(
-      { email: "budi@contoh.id", quota: "2G" },
+      { email: "budi@contoh.id", quota: "2G", disabled: false },
       {
         displayName: "Budi S",
         role: "USER",
@@ -301,7 +304,7 @@ describe("toAccountView", () => {
   it("akun yang belum pernah login: nama dari bagian lokal, role dari ADMIN_EMAILS, belum terdaftar", () => {
     expect(
       toAccountView(
-        { email: "admin@contoh.id", quota: null },
+        { email: "admin@contoh.id", quota: null, disabled: false },
         undefined,
         admins,
       ),
@@ -313,7 +316,11 @@ describe("toAccountView", () => {
       registered: false,
     });
     expect(
-      toAccountView({ email: "siti@contoh.id", quota: null }, undefined, admins)
+      toAccountView(
+        { email: "siti@contoh.id", quota: null, disabled: false },
+        undefined,
+        admins,
+      )
         .role,
     ).toBe("USER");
   });

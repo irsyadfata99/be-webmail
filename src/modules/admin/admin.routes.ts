@@ -4,8 +4,10 @@ import { env } from "../../config/env.js";
 import { requireAdmin, requireAuth } from "../../middleware/auth.js";
 import { csrfProtection } from "../../middleware/csrf.js";
 import { AppError } from "../../middleware/error-handler.js";
+import { listAuditLogs } from "./admin.audit.js";
 import {
   accountParams,
+  auditLogsQuery,
   createAccountBody,
   passwordBody,
   patchAccountBody,
@@ -61,6 +63,10 @@ adminRouter.use((_req, res, next) => {
 
 adminRouter.get("/accounts", async (_req, res) => {
   res.json({ accounts: await listAccounts(getAgent()) });
+});
+
+adminRouter.get("/audit-logs", async (req, res) => {
+  res.json(await listAuditLogs(auditLogsQuery.parse(req.query)));
 });
 
 adminRouter.post("/accounts", async (req, res) => {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { env } from "../../config/env.js";
+import { DEFAULT_PAGE_SIZE } from "../mail/mail.page.js";
 import { noControlChars } from "../mail/mail.schema.js";
 import {
   normalizeEmail,
@@ -69,3 +70,49 @@ export const patchAccountBody = z
 
 export type CreateAccountBody = z.infer<typeof createAccountBody>;
 export type PatchAccountBody = z.infer<typeof patchAccountBody>;
+
+const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+
+const queryDate = z
+  .string()
+  .trim()
+  .refine((v) => !Number.isNaN(Date.parse(v)), "tanggal tidak valid");
+
+/** Filter log audit; semua opsional. `to` berupa tanggal saja mencakup seluruh hari itu. */
+export const auditLogsQuery = z
+  .object({
+    page: z.coerce.number().int().min(1).max(10_000).default(1),
+    pageSize: z.coerce.number().int().min(1).max(100).default(DEFAULT_PAGE_SIZE),
+    actor: accountEmail.optional(),
+    target: accountEmail.optional(),
+    action: z
+      .string()
+      .trim()
+      .regex(/^[A-Z][A-Z0-9_]{0,63}$/, "action tidak valid")
+      .optional(),
+    from: queryDate.optional(),
+    to: queryDate.optional(),
+  })
+  .transform((q, ctx) => {
+    const from = q.from ? new Date(q.from) : undefined;
+    let to: Date | undefined;
+    let toInclusive = true;
+    if (q.to) {
+      to = new Date(q.to);
+      if (dateOnly.test(q.to)) {
+        to.setUTCDate(to.getUTCDate() + 1);
+        toInclusive = false;
+      }
+    }
+    if (from && to && from >= to) {
+      ctx.addIssue({
+        code: "custom",
+        message: "from harus lebih awal dari to",
+        path: ["from"],
+      });
+      return z.NEVER;
+    }
+    return { ...q, from, to, toInclusive };
+  });
+
+export type AuditLogsQuery = z.infer<typeof auditLogsQuery>;

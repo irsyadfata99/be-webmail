@@ -4,6 +4,8 @@ import { AppError } from "../../middleware/error-handler.js";
 export interface AgentAccount {
   email: string;
   quota: string | null;
+  /** true bila login IMAP/SMTP akun dikunci oleh layanan akun. */
+  disabled: boolean;
 }
 
 /** Antarmuka layanan akun; dipisah agar tes bisa memakai tiruan. */
@@ -12,6 +14,8 @@ export interface AgentApi {
   create(email: string, password: string): Promise<void>;
   setPassword(email: string, password: string): Promise<void>;
   setQuota(email: string, quota: string | null): Promise<void>;
+  /** false mengunci login IMAP/SMTP; true membukanya lagi. Idempoten. */
+  setActive(email: string, active: boolean): Promise<void>;
   remove(email: string): Promise<void>;
 }
 
@@ -99,12 +103,17 @@ export function createAgentClient(options: AgentClientOptions): AgentApi {
         );
       }
       return data.accounts.flatMap((a: unknown) => {
-        const row = a as { email?: unknown; quota?: unknown };
+        const row = a as {
+          email?: unknown;
+          quota?: unknown;
+          disabled?: unknown;
+        };
         if (typeof row.email !== "string") return [];
         return [
           {
             email: row.email,
             quota: typeof row.quota === "string" ? row.quota : null,
+            disabled: row.disabled === true,
           },
         ];
       });
@@ -117,6 +126,9 @@ export function createAgentClient(options: AgentClientOptions): AgentApi {
     },
     async setQuota(email, quota) {
       await call("PUT", `${account(email)}/quota`, { quota });
+    },
+    async setActive(email, active) {
+      await call("PUT", `${account(email)}/active`, { active });
     },
     async remove(email) {
       await call("DELETE", account(email));

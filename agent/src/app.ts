@@ -130,7 +130,9 @@ async function route(
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "Metode tidak diizinkan");
   }
 
-  const match = /^\/accounts\/([^/]+)(\/password|\/quota)?$/.exec(path);
+  const match = /^\/accounts\/([^/]+)(\/password|\/quota|\/active)?$/.exec(
+    path,
+  );
   if (match) {
     const email = emailParam(match[1] ?? "", config.domain);
     const sub = match[2];
@@ -145,6 +147,27 @@ async function route(
       }
       await store.setPassword(email, passwordField(await readJson(req)));
       send(res, 200, { email });
+      return 200;
+    }
+
+    if (sub === "/active") {
+      if (method !== "PUT") {
+        throw new HttpError(
+          405,
+          "METHOD_NOT_ALLOWED",
+          "Metode tidak diizinkan",
+        );
+      }
+      const body = await readJson(req);
+      if (typeof body.active !== "boolean") {
+        throw new HttpError(
+          400,
+          "INVALID_ACTIVE",
+          "active harus berupa true atau false",
+        );
+      }
+      await store.setActive(email, body.active);
+      send(res, 200, { email, active: body.active });
       return 200;
     }
 
