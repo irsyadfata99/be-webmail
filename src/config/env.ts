@@ -87,6 +87,19 @@ const schema = z
     // samakan dengan POSTFIX_MESSAGE_SIZE_LIMIT di mailserver dan message_size_limit di relay VPS.
     MAX_MESSAGE_MB: z.coerce.number().int().min(1).max(200).default(50),
 
+    // Layanan akun (account-agent) di jaringan Docker yang sama. Keduanya diisi atau keduanya kosong;
+    // bila kosong, rute /api/admin mengembalikan 503 AGENT_NOT_CONFIGURED.
+    AGENT_URL: z
+      .string()
+      .optional()
+      .transform((v) => (v && v.trim().length > 0 ? v.trim() : undefined))
+      .pipe(z.url().optional()),
+    AGENT_TOKEN: z
+      .string()
+      .optional()
+      .transform((v) => (v && v.trim().length > 0 ? v.trim() : undefined))
+      .pipe(hex64.optional()),
+
     ADMIN_EMAILS: z
       .string()
       .default("")
@@ -101,6 +114,13 @@ const schema = z
     message: "SESSION_SECRET dan CREDENTIAL_ENCRYPTION_KEY tidak boleh sama",
     path: ["CREDENTIAL_ENCRYPTION_KEY"],
   })
+  .refine(
+    (e) => (e.AGENT_URL === undefined) === (e.AGENT_TOKEN === undefined),
+    {
+      message: "AGENT_URL dan AGENT_TOKEN harus diisi bersamaan",
+      path: ["AGENT_TOKEN"],
+    },
+  )
   .refine((e) => e.MAX_ATTACHMENT_MB <= e.MAX_TOTAL_ATTACHMENT_MB, {
     message: "tidak boleh lebih besar dari MAX_TOTAL_ATTACHMENT_MB",
     path: ["MAX_ATTACHMENT_MB"],
