@@ -365,7 +365,15 @@ interface RawEvent {
   "GOOGLE-CONFERENCE"?: unknown;
 }
 
-const isoDay = (d: Date): string => d.toISOString().slice(0, 10);
+/**
+ * node-ical membaca tanggal tanpa jam (VALUE=DATE) sebagai tengah malam WAKTU LOKAL server.
+ * Karena itu harinya harus dibaca dengan getter lokal; toISOString() menggeser satu hari
+ * di zona waktu positif (mis. Asia/Jakarta) dan tes gagal di laptop meski lolos di Docker (UTC).
+ */
+const isoDay = (d: Date): string => {
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+};
 
 /** Membaca satu undangan dari teks ICS. Null bila bukan ICS yang berisi acara. */
 export function parseInvitation(ics: string): Invitation | null {
@@ -403,7 +411,11 @@ export function parseInvitation(ics: string): Invitation | null {
       : startDate;
   // DTEND sehari penuh eksklusif; tampilkan hari terakhir (inklusif).
   if (allDay && endDate.getTime() > startDate.getTime()) {
-    endDate = new Date(endDate.getTime() - DAY_MS);
+    endDate = new Date(
+      endDate.getFullYear(),
+      endDate.getMonth(),
+      endDate.getDate() - 1,
+    );
   }
 
   const organizer = personOf(event.organizer)?.person ?? null;
@@ -481,5 +493,3 @@ export function findInvitation(
   }
   return null;
 }
-
-
