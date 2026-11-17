@@ -13,6 +13,47 @@ import {
 } from "../auth/login-throttle.js";
 import type { PasswordChangeBody, ProfileBody } from "./account.schema.js";
 
+/** Batas menunggu mail server memuat password baru (jeda perubahan berkas konfigurasi). */
+export const READY_TIMEOUT_MS = 20_000;
+export const READY_INTERVAL_MS = 1_000;
+
+export interface ReadyOptions {
+  verify?: typeof verifyImapLogin;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  timeoutMs?: number;
+  intervalMs?: number;
+}
+
+/**
+ * Menunggu sampai mail server menerima password baru. Dovecot memuat ulang berkas akun beberapa
+ * detik setelah agent menulisnya; tanpa menunggu, permintaan pertama sesudah ganti password
+ * ditolak dan sesi ikut dicabut. Mengembalikan false bila sampai batas waktu belum siap.
+ */
+export async function waitForMailServer(
+  email: string,
+  password: string,
+  opts: ReadyOptions = {},
+): Promise<boolean> {
+  const verify = opts.verify ?? verifyImapLogin;
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const timeoutMs = opts.timeoutMs ?? READY_TIMEOUT_MS;
+  const intervalMs = opts.intervalMs ?? READY_INTERVAL_MS;
+  const deadline = now() + timeoutMs;
+
+  for (;;) {
+    try {
+      if ((await verify(email, password)) === "ok") return true;
+    } catch (err) {
+      if (!(err instanceof MailServerUnavailableError)) throw err;
+    }
+    if (now() + intervalMs >= deadline) return false;
+    await sleep(intervalMs);
+  }
+}
+
 export interface ProfileView {
   email: string;
   displayName: string;
@@ -80,15 +121,16 @@ export async function updateProfile(
 
 /**
  * Mengganti password sendiri. Password lama diverifikasi lewat login IMAP, password baru
- * ditulis oleh layanan akun. Sesi ini diperbarui agar tetap login; sesi lain dicabut
- * karena masih menyimpan password lama.
+ * ditulis oleh layanan akun. Setelah mail server menerima password baru, sesi ini diperbarui
+ * agar tetap login; sesi lain dicabut karena masih menyimpan password lama.
  */
 export async function changePassword(
   req: Request,
   auth: Express.AuthContext,
   agent: AgentApi,
   body: PasswordChangeBody,
-): Promise<{ sessionsRevoked: number }> {
+  ready: ReadyOptions = {},
+): Promise<{ sessionsRevoked: number; mailServerReady: boolean }> {
   const email = auth.user.email;
   const key = `pw:${email}`;
   const ip = req.ip ?? "unknown";
@@ -125,6 +167,13 @@ export async function changePassword(
   await agent.setPassword(email, body.newPassword);
   await clearFailures(key);
 
+  // Tunggu mail server menerima password baru sebelum sesi dipindahkan ke password itu.
+  const mailServerReady = await waitForMailServer(
+    email,
+    body.newPassword,
+    ready,
+  );
+
   const [, revoked] = await prisma.$transaction([
     prisma.session.update({
       where: { id: auth.sessionId },
@@ -143,7 +192,7 @@ export async function changePassword(
     actorId: auth.user.id,
     action: "PASSWORD_CHANGED",
     targetEmail: email,
-    metadata: { sessionsRevoked: revoked.count },
+    metadata: { sessionsRevoked: revoked.count, mailServerReady },
   });
-  return { sessionsRevoked: revoked.count };
+  return { sessionsRevoked: revoked.count, mailServerReady };
 }

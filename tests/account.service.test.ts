@@ -22,6 +22,7 @@ import { AppError } from "../src/middleware/error-handler.js";
 import {
   changePassword,
   updateProfile,
+  waitForMailServer,
 } from "../src/modules/account/account.service.js";
 import { CREDENTIAL_CONTEXT } from "../src/modules/auth/auth.service.js";
 
@@ -75,12 +76,17 @@ describe("changePassword", () => {
     const agent = makeAgent();
     const r = await changePassword(req, auth, agent, body);
 
-    expect(r).toEqual({ sessionsRevoked: 2 });
+    expect(r).toEqual({ sessionsRevoked: 2, mailServerReady: true });
     expect(imap.verifyImapLogin).toHaveBeenCalledWith(
       "budi@contoh.id",
       body.currentPassword,
     );
     expect(agent.setPassword).toHaveBeenCalledWith(
+      "budi@contoh.id",
+      body.newPassword,
+    );
+    // Menunggu mail server menerima password baru sebelum sesi dipindahkan.
+    expect(imap.verifyImapLogin).toHaveBeenLastCalledWith(
       "budi@contoh.id",
       body.newPassword,
     );
@@ -104,7 +110,7 @@ describe("changePassword", () => {
     });
     const audit = db.auditLog.create.mock.calls.at(-1)![0].data;
     expect(audit.action).toBe("PASSWORD_CHANGED");
-    expect(audit.metadata).toEqual({ sessionsRevoked: 2 });
+    expect(audit.metadata).toEqual({ sessionsRevoked: 2, mailServerReady: true });
     // Password tidak boleh bocor ke audit.
     expect(JSON.stringify(audit)).not.toContain("Sandi");
   });
@@ -159,6 +165,87 @@ describe("changePassword", () => {
     expect(db.session.update).not.toHaveBeenCalled();
     expect(db.session.updateMany).not.toHaveBeenCalled();
     expect(db.loginAttempt.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("changePassword: menunggu mail server", () => {
+  it("mail server belum siap sampai batas waktu: tetap berhasil dengan mailServerReady false", async () => {
+    // Login dengan password lama berhasil, tetapi password baru belum diterima.
+    imap.verifyImapLogin.mockImplementation(async (_e: string, p: string) =>
+      p === body.currentPassword ? "ok" : "invalid_credentials",
+    );
+    let t = 0;
+    const agent = makeAgent();
+    const r = await changePassword(req, auth, agent, body, {
+      now: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+      timeoutMs: 5_000,
+      intervalMs: 1_000,
+    });
+
+    expect(r.mailServerReady).toBe(false);
+    expect(r.sessionsRevoked).toBe(2);
+    expect(agent.setPassword).toHaveBeenCalledOnce();
+    // Sesi tetap dipindahkan ke password baru walau mail server belum siap.
+    expect(db.session.update).toHaveBeenCalledOnce();
+    expect(db.auditLog.create.mock.calls.at(-1)![0].data.metadata).toEqual({
+      sessionsRevoked: 2,
+      mailServerReady: false,
+    });
+  });
+});
+
+describe("waitForMailServer", () => {
+  const clock = () => {
+    let t = 0;
+    return {
+      now: () => t,
+      sleep: async (ms: number) => {
+        t += ms;
+      },
+    };
+  };
+
+  it("langsung true bila mail server sudah menerima", async () => {
+    const verify = vi.fn().mockResolvedValue("ok");
+    expect(await waitForMailServer("a@b.id", "x", { verify, ...clock() })).toBe(
+      true,
+    );
+    expect(verify).toHaveBeenCalledTimes(1);
+  });
+
+  it("mengulang sampai berhasil", async () => {
+    const verify = vi
+      .fn()
+      .mockResolvedValueOnce("invalid_credentials")
+      .mockResolvedValueOnce("invalid_credentials")
+      .mockResolvedValueOnce("ok");
+    expect(await waitForMailServer("a@b.id", "x", { verify, ...clock() })).toBe(
+      true,
+    );
+    expect(verify).toHaveBeenCalledTimes(3);
+  });
+
+  it("menganggap mail server mati sementara sebagai belum siap, lalu menyerah di batas waktu", async () => {
+    const verify = vi.fn().mockRejectedValue(new MailServerUnavailableError());
+    const r = await waitForMailServer("a@b.id", "x", {
+      verify,
+      ...clock(),
+      timeoutMs: 3_000,
+      intervalMs: 1_000,
+    });
+    expect(r).toBe(false);
+    expect(verify.mock.calls.length).toBeGreaterThan(1);
+    expect(verify.mock.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it("galat tak terduga diteruskan, tidak ditelan", async () => {
+    const verify = vi.fn().mockRejectedValue(new Error("meledak"));
+    await expect(
+      waitForMailServer("a@b.id", "x", { verify, ...clock() }),
+    ).rejects.toThrow("meledak");
   });
 });
 
