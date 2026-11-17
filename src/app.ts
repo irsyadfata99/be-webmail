@@ -26,7 +26,10 @@ export function createApp(): Express {
         res.setHeader("X-Request-Id", id);
         return id;
       },
-      autoLogging: { ignore: (req) => req.url === "/health" },
+      autoLogging: {
+        ignore: (req) =>
+          req.url === "/health" || req.url === "/api/monitor/status",
+      },
     }),
   );
   app.use(helmet());

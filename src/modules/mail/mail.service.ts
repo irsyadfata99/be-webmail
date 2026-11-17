@@ -119,6 +119,11 @@ const MAX_MESSAGE_BYTES = env.MAX_MESSAGE_MB * 1024 * 1024;
 const HEAVY_MESSAGE_BYTES = 10 * 1024 * 1024;
 const heavyGate = createGate(2, 10);
 
+/** Keadaan antrean pengurai pesan besar, untuk monitoring. */
+export function heavyGateStats(): { active: number; waiting: number } {
+  return { active: heavyGate.active, waiting: heavyGate.waiting };
+}
+
 export interface MessageDetail extends ParsedMessage {
   folder: string;
   uid: number;

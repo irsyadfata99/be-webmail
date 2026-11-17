@@ -103,6 +103,31 @@ const schema = z
     // Akun ADMIN wajib mengaktifkan 2FA sebelum boleh memakai /api/admin.
     ADMIN_REQUIRE_2FA: z.stringbool().default(true),
 
+    // Kunci API untuk aplikasi monitoring (maksimal 2 agar bisa diganti tanpa putus layanan).
+    // Kosong = endpoint /api/monitor/status dimatikan (404).
+    MONITOR_KEYS: z
+      .string()
+      .default("")
+      .transform((v) =>
+        v
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean),
+      )
+      .pipe(
+        z
+          .array(
+            z
+              .string()
+              .regex(/^[0-9a-f]{64}$/, "tiap kunci harus 64 karakter hex"),
+          )
+          .max(2, "maksimal 2 kunci")
+          .refine(
+            (a) => new Set(a).size === a.length,
+            "kunci tidak boleh sama",
+          ),
+      ),
+
     ADMIN_EMAILS: z
       .string()
       .default("")
@@ -122,6 +147,19 @@ const schema = z
     {
       message: "AGENT_URL dan AGENT_TOKEN harus diisi bersamaan",
       path: ["AGENT_TOKEN"],
+    },
+  )
+  .refine(
+    (e) =>
+      e.MONITOR_KEYS.every(
+        (k) =>
+          k !== e.SESSION_SECRET &&
+          k !== e.CREDENTIAL_ENCRYPTION_KEY &&
+          k !== e.AGENT_TOKEN,
+      ),
+    {
+      message: "kunci monitoring tidak boleh sama dengan rahasia lain",
+      path: ["MONITOR_KEYS"],
     },
   )
   .refine((e) => e.MAX_ATTACHMENT_MB <= e.MAX_TOTAL_ATTACHMENT_MB, {
